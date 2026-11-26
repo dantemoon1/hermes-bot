@@ -73,6 +73,8 @@ final class RosterModel {
     private var watching: Task<Void, Never>?
     /// The connection the watch is on.
     private var watchedClient: GatewayClient?
+    /// False once the watched connection's event stream has ended.
+    private var isWatchedClientAlive = false
     /// Kept for as long as the roster lives: the connection also carries the bots' events.
     private var client: GatewayClient?
     /// A gateway given outright, which is used and never saved: tests pass one, and
@@ -490,6 +492,7 @@ final class RosterModel {
         let chat = ChatModel()
         chat.questions.memory = connectionMemory
         chat.questions.owner = bot.name
+        chat.approvalsHold = approvalsHold
         chat.questions.onChange = { [weak self] in self?.waitingChanged() }
         return chat
     }
@@ -502,7 +505,14 @@ final class RosterModel {
     }
 
     private func take(_ bots: [Bot]) {
+        let previousNames = Set(self.bots.map(\.name))
+        let newNames = Set(bots.map(\.name))
         self.bots = bots
+        if newNames != previousNames {
+            approvalsStateChanged(because: "The bots on the gateway changed since this was read.")
+        } else {
+            invalidateApprovalsIfRosterChanged(to: newNames)
+        }
         looks = Dictionary(bots.map { ($0.id, $0.look) }, uniquingKeysWith: { first, _ in first })
         previews = Dictionary(bots.compactMap { bot in
             bot.chat.map { (bot.id, ReplyFormat.preview(of: $0.preview)) }
@@ -1043,6 +1053,531 @@ final class RosterModel {
         unread.union(bots.filter { isWaiting($0) && !($0.id == selectedID && isLookedAt) }.map(\.id))
     }
 
+    /// When bots stop to ask leave, as Settings shows it.
+    enum Approvals: Equatable {
+        /// Not read yet, or a read before the setting was ever offered did not settle:
+        /// Settings shows nothing.
+        case unknown
+        /// Discovered on first check that this gateway does not offer per-bot approvals:
+        /// Settings shows nothing.
+        case unavailable
+        /// Every bot listed by the gateway just now has this mode.
+        case every(ApprovalMode)
+        /// The bots listed by the gateway just now differ.
+        case mixed
+        /// Being read or changed just now: what was shown before is no longer known to hold.
+        case checking
+        /// The gateway did not confirm every bot's mode, or the connection or bots changed
+        /// since it did. Nothing said before is shown in its place; Settings offers Try Again.
+        case unconfirmed
+    }
+
+    private(set) var approvals = Approvals.unknown
+    /// Why the approval mode is not confirmed, or why a change did not go through everywhere.
+    private(set) var approvalsProblem: String?
+    /// Once this gateway has been seen to offer per-bot approvals, the card stays shown
+    /// (with Try Again when unconfirmed) until the gateway is left.
+    private var approvalsOffered = false
+    /// The connection and exact bot set for which the currently shown mode was confirmed.
+    private var approvalsClient: GatewayClient?
+    private var approvalsBots: Set<String>?
+    /// What the person's last change asked for and what kept it from every bot, kept across
+    /// rechecks until they ask again or the gateway confirms what they asked for.
+    private var approvalsChangeNote: (asked: ApprovalMode, problem: String)?
+    /// Why the latest move of `approvalsEpoch` that was not a change of bots happened, so a
+    /// check it stopped says that rather than blaming the bots.
+    private var approvalsInterruption: String?
+    /// Counts readings and changes as they begin. Only the latest may say what is shown;
+    /// leaving the gateway counts too, so nothing begun for it says anything after.
+    private var approvalsAsked = 0
+    /// Monotonic generation bumped whenever roster membership, connection liveness, or a
+    /// chat `/approvals` command changes state that could outdate an in-flight check.
+    private var approvalsEpoch = 0
+    /// The change of every bot's mode under way, by its count. Held until that change has
+    /// unwound, even once overtaken by leaving the gateway; Settings offers no other change
+    /// meanwhile, while it is the latest ask.
+    private var settingApprovals: Int?
+    var isSettingApprovals: Bool { settingApprovals != nil && settingApprovals == approvalsAsked }
+    /// The writes of the last change, done once they have unwound. A change waits for the one
+    /// before, even one overtaken by leaving the gateway and coming back, so two never reach a
+    /// bot out of order from this app. A write already on the wire when its connection drops
+    /// may still land late on the gateway: only a revision on the gateway's config could order that.
+    private var approvalsWrites: Task<Void, Never>?
+    /// Timeout per RPC for reading or changing approval modes. Shortened in tests.
+    var approvalRequestTimeout: Duration = .seconds(30)
+    /// How often an open Settings panel quietly re-proves a shown mode against the gateway,
+    /// since Hermes emits no push event when another client creates/deletes a bot or changes
+    /// `approvals.mode` on idle bots. Shortened in tests.
+    var approvalsRecheckInterval: Duration = .seconds(5)
+
+    private enum ApprovalsAsk: Equatable { case read, set(ApprovalMode) }
+    private enum ApprovalsFound {
+        /// The gateway has just confirmed what every bot it lists has.
+        /// `through`: the number of the last bot list the connection had heard when it was proved.
+        case confirmed(Approvals, bots: Set<String>, on: GatewayClient, problem: String?, through: Int)
+        /// The gateway does not offer per-bot approvals.
+        case unavailable(problem: String?)
+        /// Nothing the gateway has just confirmed can be shown.
+        case unconfirmed(problem: String?)
+    }
+
+    /// Reads every bot's approval mode straight from the gateway's own profile list.
+    func readApprovals() async { await askApprovals(.read, quiet: false) }
+
+    /// Quietly re-proves the mode while Settings remains open, without flickering "Checking…".
+    /// Updates the shown mode if the gateway changed, expires to Not confirmed if the recheck
+    /// fails, and keeps asking from Not confirmed, or from a first read that did not settle,
+    /// so a passing failure heals by itself. A gateway found not to offer it is not asked again.
+    func recheckApprovals() async {
+        guard !isSettingApprovals else { return }
+        switch approvals {
+        case .every, .mixed, .unconfirmed, .unknown: await askApprovals(.read, quiet: true)
+        case .checking, .unavailable: break
+        }
+    }
+
+    /// Sets every bot's approval mode (from the gateway's own profile list), then reads them
+    /// back and verifies the profile list did not change. One change at a time.
+    func setApprovals(_ mode: ApprovalMode) async {
+        guard !isSettingApprovals else { return }
+        approvalsChangesAsked += 1
+        approvalsLastEvery = nil
+        approvalsChangeNote = nil
+        await askApprovals(.set(mode), quiet: false)
+    }
+
+    /// Changes of every bot's mode asked for, so a mode carried to a new bot is not written over one asked since.
+    private var approvalsChangesAsked = 0
+    /// Changes of a bot's mode in chat (`/approvals`), for the same reason.
+    private var approvalsChatChanges = 0
+    /// The mode the gateway last confirmed for every bot, kept apart from what is shown, so a bot
+    /// made just after another (when what is shown is Not confirmed) is still given it. Let go when a read finds otherwise, a change is asked for, a chat
+    /// changes a bot's mode, or the gateway is left.
+    private var approvalsLastEvery: ApprovalMode?
+    /// Writes of approval modes under way, which every chat holds its messages for.
+    let approvalsHold = ApprovalsHold()
+
+    /// Try Again: the person moving on from what was said before, so the last change's note goes.
+    func tryApprovalsAgain() async {
+        guard !isSettingApprovals else { return }
+        approvalsChangeNote = nil
+        await askApprovals(.read, quiet: false)
+    }
+
+    /// Called when `/approvals <mode>` begins or finishes in chat so an open Settings panel
+    /// never keeps showing an outdated mode or lets a concurrent check confirm one.
+    func approvalsChangedInChat() {
+        approvalsChatChanges += 1
+        approvalsLastEvery = nil
+        approvalsChangeNote = nil
+        approvalsStateChanged(because: "A bot's approval mode was changed in chat.", interrupting: true)
+    }
+
+    /// `interrupting`: the reason is not a change of bots, and a check it stops says so.
+    private func approvalsStateChanged(because reason: String, interrupting: Bool = false) {
+        approvalsEpoch += 1
+        approvalsInterruption = interrupting ? reason : nil
+        invalidateApprovals(because: reason)
+    }
+
+    private func invalidateApprovals(because reason: String) {
+        switch approvals {
+        case .every, .mixed:
+            approvals = .unconfirmed
+            approvalsProblem = withChangeNote(reason)
+            approvalsClient = nil
+            approvalsBots = nil
+        default: break
+        }
+    }
+
+    /// A bot list heard on a connection: a claim proved there for other bots no longer holds.
+    /// Every bot list heard lately, by connection and number, so a check about to confirm can be
+    /// held to any that came after the ones it read, whether or not a claim was shown when they came.
+    private var approvalsListings: [(client: ObjectIdentifier, number: Int, names: Set<String>)] = []
+    /// The highest number let go of from `approvalsListings`, by connection.
+    private var approvalsListingsLost: [ObjectIdentifier: Int] = [:]
+    /// The number of the last bot list the shown claim was proved through.
+    private var approvalsThrough: Int?
+    /// Runs after a check's last read and before it confirms, so a test can have a bot list
+    /// arrive in between. For tests.
+    var approvalsWillCommit: (@MainActor () async -> Void)?
+
+    /// Which bots refused the latest change, by its count, kept apart from why it stopped so the
+    /// note left afterwards is only that.
+    private var approvalsRefused: (ask: Int, text: String)?
+
+    /// A reason, with what else is known to have gone wrong after it when that is not already said.
+    private func joined(_ reason: String, _ problem: String?) -> String {
+        guard let problem, !reason.contains(problem) else { return reason }
+        return "\(reason) \(problem)"
+    }
+
+    /// Why the shown state is what it is, with what kept the person's last change from every
+    /// bot after it when that is not already said.
+    private func withChangeNote(_ reason: String?) -> String? {
+        guard let note = approvalsChangeNote?.problem else { return reason }
+        guard let reason, !reason.contains(note) else { return reason ?? note }
+        return "\(reason) \(note)"
+    }
+
+    /// A bot list heard on a connection: kept for a check about to confirm, and a shown claim
+    /// proved there before it, for other bots, no longer holds (Sol, rounds 4 and 5).
+    private func approvalsHeard(_ number: Int, _ names: Set<String>, on heardOn: GatewayClient) {
+        let id = ObjectIdentifier(heardOn)
+        approvalsListings.append((id, number, names))
+        if approvalsListings.count > 256 {
+            let gone = approvalsListings.removeFirst()
+            approvalsListingsLost[gone.client] = max(approvalsListingsLost[gone.client] ?? 0, gone.number)
+        }
+        guard heardOn === approvalsClient, let proven = approvalsBots, let through = approvalsThrough,
+              number > through, names != proven else { return }
+        invalidateApprovals(because: "The bots on the gateway changed since this was read.")
+    }
+
+    /// Whether a bot list heard on `client` after number `through` names other bots, or may have.
+    private func approvalsContradicted(_ bots: Set<String>, on client: GatewayClient, after through: Int) -> Bool {
+        let id = ObjectIdentifier(client)
+        if let lost = approvalsListingsLost[id], lost > through { return true }
+        return approvalsListings.contains { $0.client == id && $0.number > through && $0.names != bots }
+    }
+
+    private func invalidateApprovalsIfRosterChanged(to names: Set<String>) {
+        if let proven = approvalsBots, names != proven {
+            approvalsStateChanged(because: "The bots on the gateway changed since this was read.")
+        }
+    }
+
+    private func approvalsConnectionChanged(replacedBy next: GatewayClient? = nil, lost: GatewayClient? = nil) {
+        if let lost {
+            approvalsEpoch += 1
+            approvalsInterruption = "Lost the connection to the gateway."
+            if approvalsClient === lost {
+                invalidateApprovals(because: "Lost the connection to the gateway.")
+            }
+        } else if let confirmed = approvalsClient, confirmed !== next {
+            approvalsEpoch += 1
+            approvalsInterruption = "The connection to the gateway changed meanwhile."
+            invalidateApprovals(because: "The connection to the gateway changed since this was read.")
+        }
+        // A fresh connection on a gateway where the setting was never offered may now offer it.
+        if next != nil, !approvalsOffered, approvals == .unavailable {
+            approvals = .unknown
+        }
+    }
+
+    /// The one place the approval mode shown changes. While an explicit ask runs, an already-offered
+    /// setting shows "Checking…" (or "Saving…") and drops its previous claim; however the ask ends,
+    /// it settles into a mode the gateway just confirmed for every bot it lists, or Not confirmed
+    /// with Try Again (or hidden if never offered). An ask overtaken by a later one leaves the
+    /// showing to that one. A reading during a change is left to the change's own readback.
+    private func askApprovals(_ ask: ApprovalsAsk, quiet: Bool) async {
+        guard !isSettingApprovals else { return }
+        // While a change is written, no message goes in any chat, those made meanwhile too: it
+        // would run under the mode being left.
+        let hold = approvalsHold
+        let holds = if case .set = ask { true } else { false }
+        if holds { hold.count += 1 }
+        defer { if holds { hold.count -= 1 } }
+        approvalsAsked += 1
+        let thisAsk = approvalsAsked
+        if case .set = ask {
+            settingApprovals = thisAsk
+            approvalsOffered = true
+        }
+        // What was said about an earlier ask is not shown under "Checking…" or "Saving…".
+        if !quiet { approvalsProblem = nil }
+        if approvalsOffered, !quiet {
+            approvals = .checking
+            approvalsClient = nil
+            approvalsBots = nil
+        }
+        // Default outcome if any unforeseen exit path unwinds this call.
+        var found = ApprovalsFound.unconfirmed(problem: nil)
+        defer {
+            // A bot list heard after the last one the check read, naming other bots, outweighs it,
+            // however its word reached here.
+            if case .confirmed(_, let bots, let on, let problem, let through) = found,
+               approvalsContradicted(bots, on: on, after: through) {
+                found = .unconfirmed(problem: joined(ask == .read
+                    ? "The bots on the gateway changed while this was read."
+                    : "The bots on the gateway changed meanwhile, so not every bot may have it.", problem))
+            }
+            if settingApprovals == thisAsk { settingApprovals = nil }
+            if thisAsk == approvalsAsked {
+                // Closing Settings cancels a quiet background recheck; leave an already-settled
+                // state alone instead of flashing Not confirmed behind a closed panel.
+                if quiet, Task.isCancelled {
+                    // Nothing to change: a quiet recheck never entered `.checking`.
+                } else {
+                    if case .set(let asked) = ask {
+                        let refused = approvalsRefused?.ask == thisAsk ? approvalsRefused?.text : nil
+                        switch found {
+                        case .confirmed(.every(asked), _, _, _, _): approvalsChangeNote = nil
+                        case .confirmed(_, _, _, let problem?, _), .unconfirmed(let problem?):
+                            approvalsChangeNote = (asked, refused ?? problem)
+                        case .unavailable:
+                            if let refused { approvalsChangeNote = (asked, refused) }
+                        default: break
+                        }
+                    }
+                    switch found {
+                    case .confirmed(let shown, let bots, let on, var problem, let through):
+                        if let note = approvalsChangeNote {
+                            // A quiet recheck keeps saying why the last change did not reach
+                            // every bot, until the gateway holds what was asked for.
+                            if shown == .every(note.asked) { approvalsChangeNote = nil } else { problem = problem ?? note.problem }
+                        }
+                        approvalsOffered = true
+                        approvals = shown
+                        if case .every(let mode) = shown { approvalsLastEvery = mode } else { approvalsLastEvery = nil }
+                        approvalsBots = bots
+                        approvalsClient = on
+                        approvalsThrough = through
+                        approvalsProblem = problem
+                    case .unavailable(let problem):
+                        approvalsBots = nil
+                        approvalsClient = nil
+                        if approvalsOffered {
+                            approvals = .unconfirmed
+                            approvalsProblem = withChangeNote(problem ?? (quiet ? approvalsProblem : nil))
+                        } else {
+                            approvals = .unavailable
+                            approvalsProblem = nil
+                        }
+                    case .unconfirmed(let problem):
+                        approvalsBots = nil
+                        approvalsClient = nil
+                        if approvalsOffered {
+                            // Do not clobber a more specific invalidation reason recorded while
+                            // a quiet recheck was in flight.
+                            let keepExisting = quiet && approvals == .unconfirmed && problem == nil
+                            approvals = .unconfirmed
+                            approvalsProblem = withChangeNote(keepExisting ? approvalsProblem : problem)
+                        } else {
+                            approvals = .unknown
+                            approvalsProblem = nil
+                        }
+                    }
+                }
+            }
+        }
+        found = await findApprovals(ask, thisAsk)
+    }
+
+    /// Runs one reading or change against the gateway's own `profiles.list` bookends.
+    /// Called only by `askApprovals`.
+    private func findApprovals(_ ask: ApprovalsAsk, _ thisAsk: Int) async -> ApprovalsFound {
+        let timeout = approvalRequestTimeout
+        let thisLoad = loadCount
+        let client: GatewayClient
+        do {
+            client = try await self.client(in: thisLoad)
+        } catch is CancellationError {
+            if case .set = ask {
+                return .unconfirmed(problem: "The change was stopped before it reached every bot.")
+            }
+            return .unconfirmed(problem: nil)
+        } catch {
+            if case .set = ask {
+                return .unconfirmed(problem: "Couldn't change it: the gateway couldn't be reached.")
+            }
+            return .unconfirmed(problem: nil)
+        }
+
+        // Captured after acquiring `client` (and for `.set`, after waiting on prior writes), so
+        // any roster, connection, or chat `/approvals` change during the check aborts confirmation.
+        var startingEpoch = approvalsEpoch
+        // Every `profiles.list` answer this connection hears from here on, whoever asked for it
+        // and whatever became of it, must list the bots the check proves.
+        var listingsFrom = await client.listingMark()
+
+        /// Still the latest ask, of the same load and epoch on the same live connection: what the
+        /// gateway says now may be shown. Checked before each step and before confirming.
+        func stillAsked() -> Bool {
+            thisAsk == approvalsAsked && thisLoad == loadCount && approvalsEpoch == startingEpoch
+                && client === self.client && (client !== watchedClient || isWatchedClientAlive) && !Task.isCancelled
+        }
+        let botsChanged = ask == .read
+            ? "The bots on the gateway changed while this was read."
+            : "The bots on the gateway changed meanwhile, so not every bot may have it."
+        func stopped(_ problem: String? = nil) -> ApprovalsFound {
+            if thisLoad == loadCount, thisAsk == approvalsAsked, approvalsEpoch != startingEpoch, !Task.isCancelled {
+                return .unconfirmed(problem: joined(approvalsInterruption ?? botsChanged, problem))
+            }
+            if case .set = ask {
+                return .unconfirmed(problem: joined("The change was stopped before it reached every bot.", problem))
+            }
+            return .unconfirmed(problem: problem)
+        }
+        func transportProblem(_ error: any Error) -> String {
+            switch error {
+            case is CancellationError:
+                return "The change was stopped before it reached every bot."
+            case GatewayError.timedOut:
+                return "The gateway stopped answering before the change reached every bot."
+            case GatewayError.connectionLost, GatewayError.notConnected:
+                return "Lost the connection before the change reached every bot."
+            case GatewayError.unauthorized:
+                return "Couldn't change it: \(text(for: error))"
+            default:
+                return "Couldn't change it: the gateway didn't answer."
+            }
+        }
+
+        guard stillAsked() else { return stopped() }
+
+        /// Whether every `profiles.list` answer heard on this connection since the check began
+        /// lists these bots.
+        func listingsAgree(with names: Set<String>) async -> Int? {
+            guard let listed = await client.listings(since: listingsFrom),
+                  listed.heard.allSatisfy({ $0 == names }) else { return nil }
+            return listed.through
+        }
+        /// A read that failed: said as what stopped it when something interrupted the check.
+        func failed(_ problem: String?) -> ApprovalsFound {
+            approvalsEpoch != startingEpoch ? stopped(problem) : .unconfirmed(problem: problem)
+        }
+
+        var problem: String?
+        let beforeBots: [Bot]
+        let beforeNames: Set<String>
+
+        if case .set(let mode) = ask {
+            let (unwound, done) = AsyncStream<Void>.makeStream()
+            let before = approvalsWrites
+            approvalsWrites = Task { for await _ in unwound {} }
+            defer { done.finish() }
+            await before?.value
+            // Re-anchor the epoch and the bot lists heard once prior writes have unwound, before
+            // reading `beforeBots`: what came while waiting belongs to no check.
+            startingEpoch = approvalsEpoch
+            listingsFrom = await client.listingMark()
+            guard stillAsked() else { return stopped() }
+
+            do {
+                guard try await client.keepsSettingsPerBot() else {
+                    return stillAsked() ? .unavailable(problem: "This gateway doesn't allow changing approvals per bot.") : stopped()
+                }
+            } catch GatewayError.unsupported {
+                return stillAsked() ? .unavailable(problem: "This gateway doesn't allow changing approvals.") : stopped()
+            } catch {
+                return .unconfirmed(problem: transportProblem(error))
+            }
+            guard stillAsked() else { return stopped() }
+
+            do {
+                beforeBots = try await client.allBots(timeout: timeout)
+            } catch {
+                return .unconfirmed(problem: transportProblem(error))
+            }
+            guard stillAsked() else { return stopped() }
+            beforeNames = Set(beforeBots.map(\.name))
+            guard !beforeNames.isEmpty else { return .unavailable(problem: nil) }
+            guard await listingsAgree(with: beforeNames) != nil else { return .unconfirmed(problem: botsChanged) }
+            guard stillAsked() else { return stopped() }
+
+            // Refusals are noted as they come, so a stop at a later bot still says them.
+            var failed: [String] = []
+            func refused(_ title: String) {
+                failed.append(title)
+                let text = "Couldn't change it for \(failed.joined(separator: ", "))."
+                problem = text
+                approvalsRefused = (thisAsk, text)
+            }
+            for bot in beforeBots {
+                guard stillAsked() else { return stopped(problem) }
+                do {
+                    let now = try await client.setApprovalMode(mode, of: bot.name, timeout: timeout)
+                    if now != mode { refused(bot.title) }
+                } catch is CancellationError {
+                    return stopped(problem)
+                } catch let error as GatewayError {
+                    switch error {
+                    case .timedOut, .connectionLost, .notConnected, .unauthorized:
+                        // Stop at the first transport failure: never multiply timeouts across bots.
+                        return .unconfirmed(problem: joined(transportProblem(error), problem))
+                    case .unsupported:
+                        return stillAsked() ? .unavailable(problem: joined("This gateway doesn't allow changing approvals.", problem)) : stopped(problem)
+                    case .rejected(code: 4064, _):
+                        return .unconfirmed(problem: joined(botsChanged, problem))
+                    case .rejected, .unexpectedReply:
+                        // Per-bot refusal (e.g. administrator-managed 4030 or locked 4002):
+                        // record the bot and continue so readback shows what the gateway still has.
+                        refused(bot.title)
+                        if !stillAsked() { return stopped(problem) }
+                    }
+                } catch {
+                    refused(bot.title)
+                    if !stillAsked() { return stopped(problem) }
+                }
+            }
+        } else {
+            do {
+                guard try await client.keepsSettingsPerBot() else {
+                    return stillAsked() ? .unavailable(problem: nil) : stopped()
+                }
+            } catch GatewayError.unsupported {
+                return stillAsked() ? .unavailable(problem: nil) : stopped()
+            } catch {
+                return failed(nil)
+            }
+            guard stillAsked() else { return stopped() }
+
+            do {
+                beforeBots = try await client.allBots(timeout: timeout)
+            } catch {
+                return failed(nil)
+            }
+            guard stillAsked() else { return stopped() }
+            beforeNames = Set(beforeBots.map(\.name))
+            guard !beforeNames.isEmpty else { return .unavailable(problem: nil) }
+        }
+
+        var modes: Set<ApprovalMode> = []
+        for bot in beforeBots {
+            guard stillAsked() else { return stopped(problem) }
+            do {
+                let mode = try await client.approvalMode(of: bot.name, timeout: timeout)
+                // The gateway answered for a bot while this ask is still valid: it offers per-bot approvals.
+                if stillAsked() { approvalsOffered = true }
+                modes.insert(mode)
+            } catch is CancellationError {
+                return stopped(problem)
+            } catch GatewayError.unsupported {
+                // After a change, or once offered, keep Not confirmed with Try Again.
+                if case .set = ask { return .unconfirmed(problem: problem) }
+                return stillAsked() ? .unavailable(problem: problem) : stopped(problem)
+            } catch GatewayError.rejected(code: 4064, _) {
+                return .unconfirmed(problem: joined(botsChanged, problem))
+            } catch {
+                // Stop at the first readback error: never multiply timeouts and never claim a mode.
+                return failed(problem)
+            }
+        }
+
+        // Re-read the gateway's own profile list after readback: a bot added or removed
+        // meanwhile would make a claim about every bot untrue.
+        guard stillAsked() else { return stopped(problem) }
+        let afterBots: [Bot]
+        do {
+            afterBots = try await client.allBots(timeout: timeout)
+        } catch is CancellationError {
+            return stopped(problem)
+        } catch {
+            return failed(problem)
+        }
+        let afterNames = Set(afterBots.map(\.name))
+        let through = await listingsAgree(with: afterNames)
+        if let willCommit = approvalsWillCommit { await willCommit() }
+        guard stillAsked() else { return stopped(problem) }
+        guard afterNames == beforeNames, let through else {
+            return .unconfirmed(problem: joined(botsChanged, problem))
+        }
+        guard let mode = modes.first else { return .unavailable(problem: problem) }
+        return .confirmed(modes.count == 1 ? .every(mode) : .mixed, bots: afterNames, on: client, problem: problem, through: through)
+    }
+
     /// What a bot's row says under its name: what it is waiting on the person for, if
     /// anything, else the last thing said in its chat.
     func rowPreview(for bot: Bot) -> String {
@@ -1073,6 +1608,9 @@ final class RosterModel {
         }
         alerts.reconcile(openIDs: openKeys)
     }
+
+    /// Whether the connection in use is up just now. For tests.
+    var isConnectedNow: Bool { get async { await client?.isConnected ?? false } }
 
     /// The connection to the gateway a piece of work began on, or a failure if the app has
     /// moved to another since. What changes a gateway asks for this, so nothing meant for
@@ -1342,6 +1880,7 @@ final class RosterModel {
     func load() async {
         loadCount += 1
         let thisLoad = loadCount
+        approvalsStateChanged(because: "The roster was reloaded since this was read.", interrupting: true)
         // Readings waiting to be noted belonged to the load before; left in place they
         // would stand in the way of every later one for their bot.
         for save in readSaves.values { save.cancel() }
@@ -1514,10 +2053,30 @@ final class RosterModel {
     private func watch(_ client: GatewayClient, in thisLoad: Int) {
         // A connection taken over by another: its questions can no longer be answered on it,
         // whether or not its own watch got to say so before it was replaced.
-        if let previous = watchedClient, previous !== client { questionsLost(on: previous) }
+        // Bot lists heard are kept for the connection in use only: a connection let go of may
+        // have its identity taken by the next.
+        if watchedClient !== client {
+            approvalsListings = []
+            approvalsListingsLost = [:]
+        }
+        if let previous = watchedClient, previous !== client {
+            questionsLost(on: previous)
+            approvalsConnectionChanged(replacedBy: client, lost: previous)
+        } else {
+            approvalsConnectionChanged(replacedBy: client)
+        }
         watchedClient = client
+        isWatchedClientAlive = true
         watching?.cancel()
         watching = Task { [weak self] in
+            // Any bot list this connection hears from here on withdraws a shown claim about
+            // every bot that it contradicts, even one confirmed in the moment it came.
+            await client.hearBotListings { [weak self, weak client] number, names in
+                Task { @MainActor in
+                    guard let self, let client else { return }
+                    self.approvalsHeard(number, names, on: client)
+                }
+            }
             let events = await client.events()
             // This app puts the bots' questions to the person, and answers the rest itself.
             await client.answerQuestions()
@@ -1543,7 +2102,11 @@ final class RosterModel {
                 }
             }
             // Only when the connection really went: a watch replaced by another ends here too.
-            if let self, !Task.isCancelled, thisLoad == self.loadCount { self.questionsLost(on: client) }
+            if let self, !Task.isCancelled, thisLoad == self.loadCount {
+                if self.watchedClient === client { self.isWatchedClientAlive = false }
+                self.questionsLost(on: client)
+                self.approvalsConnectionChanged(lost: client)
+            }
             while !Task.isCancelled {
                 guard let self, thisLoad == self.loadCount, self.client != nil, !self.tokenRefused else { return }
                 let wait = self.watchWait
@@ -1738,6 +2301,9 @@ final class RosterModel {
         isMakingBot = true
         defer { isMakingBot = false }
         let thisLoad = loadCount
+        // Hermes starts a new bot at its default mode, not the one every bot was last confirmed
+        // to have here: that one is written to it too, once it is made (owner's ask, PR 60).
+        let carry = approvalsLastEvery.map { (mode: $0, changes: approvalsChangesAsked, chats: approvalsChatChanges) }
         let client: GatewayClient
         do {
             // Made afresh if the connection has dropped, as it is for sending.
@@ -1776,6 +2342,8 @@ final class RosterModel {
                 triesLeft -= 1
                 do {
                     try await client.createBot(id: id)
+                    approvalsStateChanged(because: "The bots on the gateway changed since this was read.")
+                    if let carry { carryApprovals(carry.mode, to: id, titled: title, on: client, changes: carry.changes, chats: carry.chats) }
                     break making
                 } catch GatewayError.unsupported {
                     cannotMakeBots = true
@@ -1796,6 +2364,7 @@ final class RosterModel {
                     // No answer either way. A bot of that id may be there now, and may be
                     // ours or one someone else made at the same moment: the person decides
                     // before anything is written to it.
+                    approvalsStateChanged(because: "The bots on the gateway changed since this was read.")
                     let couldRead = await refreshBots()
                     guard thisLoad == loadCount else { return .failed("") }
                     guard couldRead else {
@@ -1818,6 +2387,8 @@ final class RosterModel {
             "title": .string(title),
             "avatar": .object(["shape": .string(look.shape.rawValue), "color": .string(look.color.rawValue)]),
         ])
+        // A bot made earlier whose making went unconfirmed, finished now: given the mode too.
+        if isFinishing, let carry { carryApprovals(carry.mode, to: id, titled: title, on: client, changes: carry.changes, chats: carry.chats) }
         var unsaved = false
         do { try await client.saveMeta(meta, forBot: id) } catch { unsaved = true }
         await refreshBots()
@@ -1830,6 +2401,46 @@ final class RosterModel {
         }
         selectedID = id
         return unsaved ? .madeButUnnamed(id: id, "The bot was made, but its name and face couldn't be saved.") : .made
+    }
+
+    /// Writes `mode` to a bot just made, after any change of every bot's mode already under way,
+    /// holding every chat's messages meanwhile. Left alone if a change of every bot's mode, or a
+    /// chat `/approvals`, was asked for since, which says for itself what the bots have. A read
+    /// that has since confirmed another mode for every bot is followed instead. Ends by making a shown mode Not
+    /// confirmed, so it is read again rather than claimed: what was shown before is no longer known.
+    private func carryApprovals(_ mode: ApprovalMode, to id: String, titled title: String, on client: GatewayClient, changes changesBefore: Int, chats chatsBefore: Int) {
+        let thisLoad = loadCount
+        let hold = approvalsHold
+        hold.count += 1
+        let (unwound, done) = AsyncStream<Void>.makeStream()
+        let before = approvalsWrites
+        approvalsWrites = Task { for await _ in unwound {} }
+        let timeout = approvalRequestTimeout
+        Task { [weak self] in
+            defer {
+                done.finish()
+                hold.count -= 1
+            }
+            await before?.value
+            guard let self, thisLoad == self.loadCount, changesBefore == self.approvalsChangesAsked,
+                  chatsBefore == self.approvalsChatChanges else { return }
+            let mode = self.approvalsLastEvery ?? mode
+            var given = false
+            do { given = try await client.setApprovalMode(mode, of: id, timeout: timeout) == mode } catch {}
+            guard thisLoad == self.loadCount else { return }
+            if given {
+                self.approvalsStateChanged(because: "The bots on the gateway changed since this was read.")
+            } else {
+                // Kept as the change's note, so it is said whatever is being shown or read just
+                // now, until the person asks again or every bot has the mode.
+                let failed = "Couldn't give \(title) the same approval mode as the other bots."
+                self.approvalsLastEvery = nil
+                self.approvalsChangeNote = (mode, failed)
+                self.approvalsStateChanged(because: failed)
+                // Said after whatever reason is already shown, not in its place.
+                if self.approvals == .unconfirmed { self.approvalsProblem = self.withChangeNote(self.approvalsProblem) }
+            }
+        }
     }
 
     private static func isItYours(_ id: String) -> String {
@@ -2523,6 +3134,7 @@ final class RosterModel {
             default: unclear = false
             }
             if unclear {
+                approvalsStateChanged(because: "The bots on the gateway changed since this was read.")
                 let read = await refreshBots()
                 guard thisLoad == loadCount else { return nil }
                 if read, !bots.contains(where: { $0.id == bot.id }) {
@@ -2596,6 +3208,7 @@ final class RosterModel {
         unread.remove(bot.id)
         changeCount += 1
         bots.removeAll { $0.id == bot.id }
+        approvalsStateChanged(because: "The bots on the gateway changed since this was read.")
         looks[bot.id] = nil
         waitingChanged()
         if selectedID == bot.id || selected == nil { selectedID = mainBot?.id ?? bots.first?.id }
@@ -2658,6 +3271,21 @@ final class RosterModel {
         seenQuestions = []
         seenQuestionSet = []
         alerts.clearAll()
+        approvals = .unknown
+        approvalsProblem = nil
+        approvalsOffered = false
+        approvalsClient = nil
+        approvalsBots = nil
+        approvalsChangeNote = nil
+        approvalsInterruption = nil
+        approvalsLastEvery = nil
+        approvalsListings = []
+        approvalsListingsLost = [:]
+        approvalsThrough = nil
+        // Nothing asked of the gateway left says anything now. A change still under way stops
+        // at its next step and lets go of its hold as it unwinds.
+        approvalsAsked += 1
+        approvalsEpoch += 1
         connectionUpdates = [:]
         connectionMemory.clear()
         turnsEndedUnclaimed = [:]
@@ -2689,6 +3317,8 @@ final class RosterModel {
         settingsSaving = [:]
         watching?.cancel()
         watching = nil
+        watchedClient = nil
+        isWatchedClientAlive = false
         for save in readSaves.values { save.cancel() }
         readSaves = [:]
         readThrough = [:]

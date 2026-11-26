@@ -261,9 +261,11 @@ def speak_unasked(name):
 # older route; the session authority sends them to every app with the chat open.
 REQUESTS = {}       # id -> what was asked and, once answered, the answer
 AUTO = {}           # ids of requests that belong to no chat -> their method
+APPROVALS_HUNG = []  # "approvals-hang-once": whether the first reading of approvals.mode was left unanswered
 ANSWERS = []        # what apps answered, for tests to read from /api/status; never a secret's value
 LATE_READY = 0  # seconds the greeting waits after a connection opens
 GENERATION = 7  # the execution generation every chat here is in
+APPROVAL_MODES = {}  # bot -> its approvals.mode, as config.get / config.set see it
 PRETEND_SECRET = "pretend-secret-123"  # what a test types: the answer is checked against it, never kept
 QUESTION_WORDS = ("approve", "folder", "site", "clarify", "secret", "sudo", "stale", "bridges", "ghost", "connect")
 CONNECTIONS = {}  # op id -> a connection card: its chat, its rows, and what wakes the bot when it settles
@@ -716,7 +718,15 @@ class Handler(socketserver.StreamRequestHandler):
             method, params = frame.get("method"), frame.get("params") or {}
             chat_id = str(params.get("session_id", "")).removeprefix("live-")
             if method == "profiles.list":
-                self.result(frame, {"profiles": BOTS})
+                if getattr(self, "fail_lists", False):
+                    self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 5001, "message": "could not list profiles"}})
+                elif BUSY_MODE == "approvals-stale-bookend" and getattr(self, "read_approvals", False):
+                    # Holds the post-readback list snapshot while a newer refresh can overtake it.
+                    self.read_approvals = False
+                    snapshot = list(BOTS)
+                    threading.Thread(target=lambda frame=frame, snapshot=snapshot: (time.sleep(0.8), self.result(frame, {"profiles": snapshot})), daemon=True).start()
+                else:
+                    self.result(frame, {"profiles": BOTS})
             elif method == "client.capabilities":
                 self.answers = bool(params.get("server_requests"))
                 self.result(frame, {"server_requests": ["approval", "clarify", "secret", "sudo"], "declines_not_shown": True, "canonical_clarify_batch": True})
@@ -842,6 +852,10 @@ class Handler(socketserver.StreamRequestHandler):
                     if BUSY_MODE == "untidy-delete":
                         # As a real gateway did: the bot is gone, but clearing up after it failed.
                         self.result(frame, {"blocked": False, "code": 1, "output": "Profile: x\n\nThis will permanently delete:\n  everything\nError: Could not remove profile directory: Directory not empty.\n\ninstall out of sync\n"})
+                    elif BUSY_MODE == "approvals-uncertain-delete":
+                        # Uncertain delete followed by failing profiles.list while socket stays open.
+                        self.fail_lists = True
+                        self.result(frame, {"blocked": False, "code": 1, "output": "Error: cleanup timed out\n"})
                     else:
                         self.result(frame, {"blocked": False, "code": 0, "output": "Deleted.\n"})
             elif method == "profiles.create" and BUSY_MODE == "no-bots":
@@ -853,6 +867,8 @@ class Handler(socketserver.StreamRequestHandler):
                     self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 4000, "message": f"Profile {name!r} already exists"}})
                 else:
                     BOTS.append({"name": name, "is_default": False, "model": "orbit-mini", "provider": "northwind", "description": "", "display_name": "", "ui_meta": {}})
+                    # As Hermes does (hermes_cli/config_defaults.py), a new bot starts at the default mode.
+                    APPROVAL_MODES[name] = "smart"
                     self.result(frame, {"ok": True, "name": name, "path": "/pretend/" + name, "mirrored": {}})
             elif method in ("model.options", "config.get", "config.set") and BUSY_MODE == "no-models":
                 # A gateway that cannot list models or read a bot's settings.
@@ -882,6 +898,54 @@ class Handler(socketserver.StreamRequestHandler):
                 else:
                     REASONING[name] = value
                     self.result(frame, {"key": "reasoning", "value": value})
+            elif method in ("config.get", "config.set") and params.get("key") == "approvals.mode" and BUSY_MODE == "no-config":
+                self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 4002, "message": "unknown config key: approvals.mode"}})
+            elif method == "config.get" and params.get("key") == "approvals.mode" and BUSY_MODE == "approvals-readback-fails" and APPROVAL_MODES:
+                # "approvals-readback-fails": a change goes through, and reading it back then fails.
+                self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 5001, "message": "could not read config"}})
+            elif method == "config.get" and params.get("key") == "approvals.mode" and BUSY_MODE == "approvals-readback-unsupported" and APPROVAL_MODES:
+                # "approvals-readback-unsupported": a change goes through, and reading it back is refused as unsupported.
+                self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 4002, "message": "unknown config key: approvals.mode"}})
+            elif method == "config.set" and params.get("key") == "approvals.mode" and BUSY_MODE == "approvals-set-refused":
+                # "approvals-set-refused": every change of it is refused, as a pinned key is.
+                self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 4030, "message": "approvals.mode is managed"}})
+            elif method == "config.set" and params.get("key") == "approvals.mode" and BUSY_MODE == "approvals-drop-on-set":
+                # "approvals-drop-on-set": the first write drops the socket before answering.
+                ANSWERS.append({"method": "config.set", "profile": params.get("profile") or "default", "value": params.get("value")})
+                SOCKETS.discard(self)
+                return
+            elif method == "config.set" and params.get("key") == "approvals.mode" and BUSY_MODE == "approvals-hang-on-set":
+                # "approvals-hang-on-set": never answers config.set, so a client's timeout fires.
+                ANSWERS.append({"method": "config.set", "profile": params.get("profile") or "default", "value": params.get("value")})
+                continue
+            elif method == "config.set" and params.get("key") == "approvals.mode" and BUSY_MODE == "approvals-refuse-then-hang":
+                # "approvals-refuse-then-hang": the first write is refused as a pinned key is, and
+                # every later one is never answered, so a change stops after a refusal.
+                APPROVALS_HUNG.append(True)
+                if len(APPROVALS_HUNG) == 1:
+                    self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 4030, "message": "approvals.mode is managed"}})
+                continue
+            elif method == "config.get" and params.get("key") == "approvals.mode" and BUSY_MODE == "approvals-hang-once" and not APPROVALS_HUNG:
+                # "approvals-hang-once": the first reading of it is never answered, as a gateway
+                # that passes out for a moment; every later one is.
+                APPROVALS_HUNG.append(True)
+                continue
+            elif method in ("config.get", "config.set") and params.get("key") == "approvals.mode":
+                name = "default" if BUSY_MODE == "unscoped" else (params.get("profile") or "default")
+                if BUSY_MODE == "approvals-slow":
+                    # "approvals-slow": each reading or change pauses, so another can come meanwhile.
+                    time.sleep(0.5)
+                if method == "config.set":
+                    if params.get("value") not in ("manual", "smart", "off"):
+                        self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 4002, "message": "unknown approval mode"}})
+                        continue
+                    APPROVAL_MODES[name] = params["value"]
+                    if BUSY_MODE == "approvals-slow":
+                        # Which writes came, in order, so a test can tell none was made twice or out of turn.
+                        ANSWERS.append({"method": "config.set", "profile": name, "value": params["value"]})
+                elif BUSY_MODE == "approvals-stale-bookend":
+                    self.read_approvals = True
+                self.result(frame, {"key": "approvals.mode", "value": APPROVAL_MODES.get(name, "manual")})
             elif method == "profiles.configure":
                 row = next((row for row in BOTS if row["name"] == params.get("name")), None)
                 if row is None:
@@ -1732,6 +1796,9 @@ class Handler(socketserver.StreamRequestHandler):
         if name == "approvals":
             if arg:
                 APPROVALS[chat_id] = arg
+                if arg in ("manual", "smart", "off"):
+                    owner = next((row["name"] for row in BOTS if (row.get("canonical_session") or {}).get("id") == chat_id), "default")
+                    APPROVAL_MODES[owner] = arg
                 return said(f"Approval mode set to {arg}.")
             return said(f"Approval mode: {APPROVALS.get(chat_id, 'manual')}")
         if name == "goal":
@@ -1764,6 +1831,8 @@ if __name__ == "__main__":
     BUSY_MODE = sys.argv[2] if len(sys.argv) > 2 else "interrupt"
     if BUSY_MODE == "old-hermes":
         VERSION = "v2026.9.21"
+    if BUSY_MODE == "approvals-mixed":
+        APPROVAL_MODES["garden"] = "smart"
     REDIRECT_TO = int(sys.argv[3]) if len(sys.argv) > 3 else 0
     if BUSY_MODE.endswith("+late-ready"):
         BUSY_MODE, LATE_READY = BUSY_MODE[:-len("+late-ready")], 0.3

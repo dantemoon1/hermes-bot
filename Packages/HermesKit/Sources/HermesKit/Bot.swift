@@ -110,6 +110,7 @@ extension GatewayClient {
         guard case .array(let profiles)? = result["profiles"] else {
             throw GatewayError.unexpectedReply(method: "profiles.list")
         }
+        noteListing(profiles)
         let bots = profiles.compactMap { try? $0.decode(Bot.self) }
         // None readable means the gateway's shape changed, not that there are no bots.
         guard profiles.isEmpty || !bots.isEmpty else {

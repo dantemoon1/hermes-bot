@@ -502,3 +502,109 @@ extension GatewayClient {
         }
     }
 }
+
+/// When a bot stops to ask leave before running a command: Hermes's `approvals.mode`, kept in
+/// each bot's own settings on the gateway.
+public enum ApprovalMode: String, Sendable, Equatable, CaseIterable {
+    /// Before every command that Hermes counts as dangerous.
+    case manual
+    /// Only for those a second look by the model finds risky.
+    case smart
+    /// Never.
+    case off
+}
+
+extension GatewayClient {
+    /// Every bot listed by the gateway, failing rather than skipping an entry this app cannot
+    /// read so a claim about every bot on the gateway never leaves one out.
+    public func allBots(timeout: Duration = .seconds(30)) async throws -> [Bot] {
+        let result = try await request("profiles.list", timeout: timeout)
+        guard case .array(let profiles)? = result["profiles"] else {
+            throw GatewayError.unexpectedReply(method: "profiles.list")
+        }
+        noteListing(profiles)
+        var bots: [Bot] = []
+        var seen: Set<String> = []
+        for entry in profiles {
+            guard let bot = try? entry.decode(Bot.self), !bot.name.isEmpty else {
+                throw GatewayError.unexpectedReply(method: "profiles.list")
+            }
+            if seen.insert(bot.name).inserted { bots.append(bot) }
+        }
+        return bots.filter(\.isDefault) + bots.filter { !$0.isDefault }
+    }
+
+    /// Notes which bots a `profiles.list` answer named, by each entry's `name` as given (an
+    /// entry without one stands for a bot this app cannot read), so a claim about every bot
+    /// can be held to every list the gateway gave while it was being proved.
+    func noteListing(_ profiles: [JSONValue]) {
+        var names: Set<String> = []
+        for (index, entry) in profiles.enumerated() {
+            names.insert(entry["name"]?.stringValue ?? "\u{0}unreadable \(index)")
+        }
+        listingsCount += 1
+        listingsHeard.append((listingsCount, names))
+        if listingsHeard.count > Self.listingsKept { listingsHeard.removeFirst(listingsHeard.count - Self.listingsKept) }
+        listingHeard?(listingsCount, names)
+    }
+
+    /// Tells `heard` the number and bots of every `profiles.list` answer noted from now on, so
+    /// a claim about every bot can be held to answers that came after the ones it read.
+    public func hearBotListings(_ heard: @escaping @Sendable (Int, Set<String>) -> Void) {
+        listingHeard = heard
+    }
+
+    static let listingsKept = 64
+
+    /// A point to read `listings(since:)` from.
+    public func listingMark() -> Int { listingsCount }
+
+    /// The bots every `profiles.list` answer on this client named since `mark`, oldest first,
+    /// with the number of the last of them, or nil when some of them are no longer kept.
+    public func listings(since mark: Int) -> (heard: [Set<String>], through: Int)? {
+        let wanted = listingsCount - mark
+        guard wanted <= listingsHeard.count else { return nil }
+        return (listingsHeard.suffix(wanted).map(\.names), listingsCount)
+    }
+
+    /// A bot's approval mode. Throws `GatewayError.unsupported` where this gateway does not
+    /// scope settings per bot (`keepsSettingsPerBot`) or does not know `approvals.mode`.
+    public func approvalMode(of profile: String, timeout: Duration = .seconds(30)) async throws -> ApprovalMode {
+        try await requireSettingsPerBot("config.get")
+        let result: JSONValue
+        do {
+            result = try await outOfSync("config.get") {
+                try await request("config.get", .object(["key": .string("approvals.mode"), "profile": .string(profile)]), timeout: timeout)
+            }
+        } catch GatewayError.rejected(code: 4002, let message) where message.lowercased().contains("unknown config key") {
+            // An older gateway that does not know the key.
+            throw GatewayError.unsupported(method: "config.get")
+        }
+        guard let mode = result["value"]?.stringValue.flatMap(ApprovalMode.init(rawValue:)) else {
+            throw GatewayError.unexpectedReply(method: "config.get")
+        }
+        return mode
+    }
+
+    /// Sets a bot's approval mode in its own settings on the gateway. Returns the mode the
+    /// gateway says it now has. Throws `GatewayError.unsupported` where settings are not per
+    /// bot or the key is unknown; a locked or managed key comes back as `GatewayError.rejected`.
+    @discardableResult
+    public func setApprovalMode(_ mode: ApprovalMode, of profile: String, timeout: Duration = .seconds(30)) async throws -> ApprovalMode {
+        try await requireSettingsPerBot()
+        let result: JSONValue
+        do {
+            result = try await outOfSync("config.set") {
+                try await request("config.set", .object([
+                    "key": .string("approvals.mode"), "value": .string(mode.rawValue), "profile": .string(profile),
+                ]), timeout: timeout)
+            }
+        } catch GatewayError.rejected(code: 4002, let message) where message.lowercased().contains("unknown config key") {
+            throw GatewayError.unsupported(method: "config.set")
+        }
+        guard let now = result["value"]?.stringValue.flatMap(ApprovalMode.init(rawValue:)) else {
+            throw GatewayError.unexpectedReply(method: "config.set")
+        }
+        return now
+    }
+}

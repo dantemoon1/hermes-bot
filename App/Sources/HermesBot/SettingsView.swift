@@ -33,6 +33,7 @@ struct SettingsView: View {
     let close: () -> Void
     @AppStorage(Appearance.key) private var appearance = Appearance.system
     @State private var isConfirmingSignOut = false
+    @State private var isConfirmingNeverAsk = false
     @State private var isNaming = false
     @State private var name = ""
     @FocusState private var isNamingFocused: Bool
@@ -117,6 +118,64 @@ struct SettingsView: View {
                     }
                 }
                 .padding(14)
+            }
+
+            // Only where the gateway scopes settings per bot and knows approvals.mode.
+            if roster.approvals != .unknown, roster.approvals != .unavailable {
+                section("Permissions", theme)
+                card(theme) {
+                    HStack(alignment: .center, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Approvals")
+                                .font(.system(size: 14))
+                                .foregroundStyle(theme.text)
+                            Text(roster.approvalsProblem ?? approvalsNote)
+                                .font(.system(size: 12))
+                                .foregroundStyle(theme.secondaryText)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if roster.approvals == .unconfirmed {
+                                pill("Try Again", theme) { Task { await roster.tryApprovalsAgain() } }
+                                    .padding(.top, 6)
+                            }
+                        }
+                        Spacer(minLength: 8)
+                        Menu {
+                            ForEach(ApprovalMode.allCases, id: \.self) { mode in
+                                Toggle(isOn: Binding(
+                                    get: { roster.approvals == .every(mode) },
+                                    set: { _ in
+                                        guard roster.approvals != .every(mode) else { return }
+                                        if mode == .off { isConfirmingNeverAsk = true } else { Task { await roster.setApprovals(mode) } }
+                                    }
+                                )) {
+                                    Text(Self.name(of: mode))
+                                    Text(Self.summary(of: mode))
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Text(approvalsLabel)
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundStyle(theme.secondaryText)
+                            }
+                            .font(.system(size: 13))
+                            .foregroundStyle(theme.text)
+                            .padding(.horizontal, 10)
+                            .frame(height: 28)
+                            .background(theme.raised, in: RoundedRectangle(cornerRadius: 8))
+                            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(theme.hairline))
+                        }
+                        .menuStyle(.button)
+                        .buttonStyle(.plain)
+                        .fixedSize()
+                        .accessibilityLabel("Approvals")
+                        // One change at a time, as it goes to every bot in turn.
+                        .disabled(roster.isSettingApprovals || roster.approvals == .checking)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                }
             }
 
             section("Appearance", theme)
@@ -211,6 +270,25 @@ struct SettingsView: View {
         // One shadow, under the panel as a whole, not one under every card inside it.
         .compositingGroup()
         .shadow(color: .black.opacity(0.25), radius: 30, y: 10)
+        // Reads when Settings opens, again once the roster finishes loading, and quietly rechecks
+        // while Settings stays visible so remote bot or mode changes cannot leave a stale claim.
+        .task(id: roster.phase) {
+            guard roster.phase == .loaded else { return }
+            await roster.readApprovals()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: roster.approvalsRecheckInterval)
+                guard !Task.isCancelled else { return }
+                await roster.recheckApprovals()
+            }
+        }
+        // Cancel is what Return does, matching /approvals off in chat, with no colour tint.
+        .alert("Turn off command approvals?", isPresented: $isConfirmingNeverAsk) {
+            Button("Cancel", role: .cancel) {}
+                .keyboardShortcut(.defaultAction)
+            Button("Never Ask") { Task { await roster.setApprovals(.off) } }
+        } message: {
+            Text("Every bot on \(roster.gatewayName ?? "this gateway") will stop asking before running commands, including ones that delete files.")
+        }
         .confirmationDialog(roster.isThisMac ? "Disconnect from Hermes on this Mac?" : "Disconnect from this gateway?", isPresented: $isConfirmingSignOut) {
             Button("Disconnect", role: .destructive) {
                 close()
@@ -235,6 +313,47 @@ struct SettingsView: View {
         case .loading: return "Connecting…"
         case .failed(let problem): return problem
         case .needsSetup: return ""
+        }
+    }
+
+    /// Hermes's own modes, in words.
+    static func name(of mode: ApprovalMode) -> String {
+        switch mode {
+        case .manual: "Ask every time"
+        case .smart: "Ask for risky things"
+        case .off: "Never ask"
+        }
+    }
+
+    /// Brief explanation shown under each choice in the Approvals menu.
+    static func summary(of mode: ApprovalMode) -> String {
+        switch mode {
+        case .manual: "Pause before any command Hermes counts as risky."
+        case .smart: "Let safe checks run; ask when a command still seems risky."
+        case .off: "Run commands without stopping to ask."
+        }
+    }
+
+    private var approvalsLabel: String {
+        if roster.isSettingApprovals { return "Saving…" }
+        switch roster.approvals {
+        case .every(let mode): return Self.name(of: mode)
+        case .mixed: return "Mixed"
+        case .checking: return "Checking…"
+        default: return "Not confirmed"
+        }
+    }
+
+    private var approvalsNote: String {
+        let gateway = roster.gatewayName ?? "this gateway"
+        if roster.isSettingApprovals { return "Saving for every bot on \(gateway)…" }
+        switch roster.approvals {
+        case .every(.manual): return "Bots stop and ask before any command Hermes counts as risky. For every bot on \(gateway)."
+        case .every(.smart): return "Hermes takes a second look and asks only when a command still seems risky. For every bot on \(gateway)."
+        case .every(.off): return "Bots run commands without stopping to ask. For every bot on \(gateway)."
+        case .checking: return "Checking how bots on \(gateway) ask before acting."
+        case .unconfirmed: return "Couldn't confirm how bots on \(gateway) ask before acting."
+        default: return "Your bots don't all ask the same way. Picking one sets it for every bot on \(gateway)."
         }
     }
 
