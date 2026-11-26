@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import HermesBotUI
 
@@ -373,13 +374,42 @@ import Testing
         #expect(ReplyFormat.preview(of: "MEDIA:/home/bot/chart.png") == "Sent chart.png")
     }
 
-    /// A long reply is split in a moment: it is split again each time more of it arrives.
+    /// A long reply is split in time that grows with its length, not with its square:
+    /// it is split again each time more of it arrives. Thread CPU time at two sizes is
+    /// compared, so time spent waiting behind other processes does not decide it.
     @Test func aLongReplyIsSplitQuickly() {
-        let reply = (1...400).map { "- item \($0) with `cat MEDIA:/tmp/a.png` shown in passing" }.joined(separator: "\n")
-            + "\n\n" + (1...200).map { "line \($0) of one long paragraph with `code`" }.joined(separator: "\n")
-        let clock = ContinuousClock()
-        let took = clock.measure { _ = ReplyFormat.blocks(of: reply) }
-        #expect(took < .milliseconds(250), "took \(took)")
-        #expect(ReplyFormat.blocks(of: reply).count == 401)
+        func reply(items: Int, lines: Int) -> String {
+            (1...items).map { "- item \($0) with `cat MEDIA:/tmp/a.png` shown in passing" }.joined(separator: "\n")
+                + "\n\n" + (1...lines).map { "line \($0) of one long paragraph with `code`" }.joined(separator: "\n")
+        }
+        func threadCPUSeconds() -> Double {
+            var time = timespec()
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time)
+            return Double(time.tv_sec) + Double(time.tv_nsec) / 1_000_000_000
+        }
+        func measureCPU(_ work: () -> Void) -> Double {
+            let started = threadCPUSeconds()
+            work()
+            return threadCPUSeconds() - started
+        }
+        // Small replies are enough: the growth is what carries the check, and even a
+        // regression is quick enough to be reported rather than merely timing out.
+        let short = reply(items: 10, lines: 4)
+        let long = reply(items: 40, lines: 16)
+        // Thread CPU time, not wall-clock time: waiting behind other processes is not
+        // counted. The quietest of interleaved reads is taken, so even a cache or clock
+        // change is not read as slower work.
+        _ = ReplyFormat.blocks(of: short)
+        var shortest = Double.greatestFiniteMagnitude
+        var longest = Double.greatestFiniteMagnitude
+        for _ in 0..<3 {
+            shortest = min(shortest, measureCPU { _ = ReplyFormat.blocks(of: short) })
+            longest = min(longest, measureCPU { _ = ReplyFormat.blocks(of: long) })
+        }
+        let growth = longest / shortest
+        #expect(growth < 10, "grew \(growth)x for 4x the lines (short \(shortest)s of CPU, long \(longest)s)")
+        #expect(longest < 2, "4x the lines took \(longest)s of CPU")
+        #expect(ReplyFormat.blocks(of: short).count == 11)
+        #expect(ReplyFormat.blocks(of: long).count == 41)
     }
 }

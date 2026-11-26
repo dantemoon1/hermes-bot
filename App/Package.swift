@@ -8,9 +8,11 @@ let package = Package(
     dependencies: [
         .package(path: "../Packages/HermesKit"),
         .package(path: "../Packages/HermesBotUI"),
+        // Installs updates. An exact version, chosen when it was a month old.
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.1"),
     ],
     targets: [
-        .executableTarget(name: "HermesBot", dependencies: ["HermesKit", "HermesBotUI"]),
+        .executableTarget(name: "HermesBot", dependencies: ["HermesKit", "HermesBotUI", .product(name: "Sparkle", package: "Sparkle")]),
         .testTarget(name: "HermesBotTests", dependencies: ["HermesBot", "HermesKit"]),
     ]
 )

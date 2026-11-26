@@ -77,8 +77,13 @@ final class ChatQuestions {
 
     private(set) var all: [Asked] = [] {
         // The memory keeps a card shown as waiting for as long as it is.
-        didSet { memory.setShown(Set(all.filter { $0.isOpen && { if case .connection = $0.question.kind { true } else { false } }($0) }.map(\.question.id)), owner: owner) }
+        didSet {
+            memory.setShown(Set(all.filter { $0.isOpen && { if case .connection = $0.question.kind { true } else { false } }($0) }.map(\.question.id)), owner: owner)
+            onChange?()
+        }
     }
+    /// Called whenever questions are added, answered, or settled, so the roster can update cues.
+    @ObservationIgnored var onChange: (() -> Void)?
     /// The bot whose chat these questions are in (its profile), which owns its cards' memory.
     var owner = ""
     private func key(_ opID: String) -> ConnectionMemory.Key { .init(owner: owner, op: opID) }
@@ -372,7 +377,7 @@ final class ChatQuestions {
             } catch {
                 guard let now = all.firstIndex(where: { $0.instance == instance }) else { return }
                 all[now].isMoving = false
-                if all[now].isOpen { all[now].problem = "Couldn't send that. \(GatewayProblem.text(for: error))" }
+                if all[now].isOpen { all[now].problem = Self.connectionProblem("Couldn't send that.", for: error) }
             }
         }
         return true
@@ -400,10 +405,47 @@ final class ChatQuestions {
             } catch {
                 guard let at = all.firstIndex(where: { $0.instance == instance }) else { return }
                 all[at].isMoving = false
-                if all[at].isOpen { all[at].problem = "Couldn't try that again. \(GatewayProblem.text(for: error))" }
+                if all[at].isOpen { all[at].problem = Self.connectionProblem("Couldn't try that again.", for: error) }
             }
         }
         return true
+    }
+
+    /// Plain wording when a move or reissue on a connection card is refused or fails, using the
+    /// structured `reason` from Hermes (`ConnectorErrorReason` / `AuthorityRefusal`) before
+    /// falling back to the gateway's message or general transport wording.
+    static func connectionProblem(_ lead: String, for error: any Error) -> String {
+        if let refusal = error as? GatewayClient.ConnectionRefusal {
+            let detail: String = switch refusal.reason {
+            case "LINK_STILL_VALID": "That sign-in link is still active."
+            case "REISSUE_REFUSED":
+                // Both SETTLED and NOT_ALLOWED share reason `REISSUE_REFUSED` in Hermes (`connector_refusals.py`).
+                refusal.message.localizedCaseInsensitiveContains("settled")
+                    ? "This card has already finished."
+                    : "Hermes won't run this item again."
+            case "UNKNOWN_TARGET": "That item isn't on this card."
+            case "CONNECTORS_UNAVAILABLE": "Connectors aren't available in this chat."
+            case "NEEDS_NOUS_AUTH": "Connectors need you to sign in to your account again."
+            case "ORG_ACCESS_DENIED": "This account cannot manage connectors for this organization."
+            case "FORBIDDEN_SCOPE": "Connector access is not permitted for this account."
+            case "CONNECTOR_REQUEST_FAILED":
+                refusal.message == "Connector request failed. Try again explicitly." || refusal.message.isEmpty
+                    ? "The connector request failed."
+                    : refusal.message
+            case "INVALID_ANSWER": "The gateway didn't accept that."
+            case "UNSUPPORTED_RUNTIME": "Connectors can only be set up on the computer the bot runs on."
+            case "not_found": "This chat is no longer open on the gateway."
+            case "NOT_OWNER": "This card comes from a chat that isn't open any more."
+            case "permission_denied", "profile_mismatch": "This account isn't allowed to change this chat."
+            default:
+                refusal.message.isEmpty || refusal.message == refusal.reason
+                    ? "The gateway refused that."
+                    : refusal.message
+            }
+            return "\(lead) \(detail)"
+        }
+        if case GatewayError.unsupported = error { return "This gateway doesn't offer that." }
+        return "\(lead) \(GatewayProblem.text(for: error))"
     }
 
     /// The person opened a row's sign-in from the card.

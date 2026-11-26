@@ -60,7 +60,8 @@ struct RosterView: View {
     private func mainTile(_ main: Bot) -> some View {
         MainBotTile(
             bot: main, look: roster.look(for: main), preview: roster.rowPreview(for: main),
-            isUnread: roster.unread.contains(main.id), isWorking: roster.isWorking(main),
+            waiting: roster.waitingText(for: main),
+            isUnread: roster.showsDot(for: main), isWorking: roster.isWorking(main),
             isSelected: roster.selectedID == main.id, isCompact: isCompact
         ) {
             roster.selectedID = main.id
@@ -82,7 +83,10 @@ struct RosterView: View {
             ScrollView {
                 LazyVStack(spacing: 4) {
                     ForEach(roster.otherBots) { bot in
-                        RailFace(bot: bot, look: roster.look(for: bot), isUnread: roster.unread.contains(bot.id), isWorking: roster.isWorking(bot), isSelected: roster.selectedID == bot.id) {
+                        RailFace(
+                            bot: bot, look: roster.look(for: bot), waiting: roster.waitingText(for: bot),
+                            isUnread: roster.showsDot(for: bot), isWorking: roster.isWorking(bot), isSelected: roster.selectedID == bot.id
+                        ) {
                             roster.selectedID = bot.id
                         }
                         .contextMenu { menu(for: bot) }
@@ -137,7 +141,11 @@ struct RosterView: View {
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(roster.otherBots) { bot in
-                        BotRow(bot: bot, look: roster.look(for: bot), preview: roster.rowPreview(for: bot), isUnread: roster.unread.contains(bot.id), isWorking: roster.isWorking(bot), isSelected: roster.selectedID == bot.id) {
+                        BotRow(
+                            bot: bot, look: roster.look(for: bot), preview: roster.rowPreview(for: bot),
+                            waiting: roster.waitingText(for: bot),
+                            isUnread: roster.showsDot(for: bot), isWorking: roster.isWorking(bot), isSelected: roster.selectedID == bot.id
+                        ) {
                             roster.selectedID = bot.id
                         }
                         .contextMenu { menu(for: bot) }
@@ -203,6 +211,8 @@ private struct MainBotTile: View {
     let look: AvatarLook
     /// The last thing said, for the card shown beside the tile under the pointer.
     let preview: String
+    /// What the bot is waiting on the person for, if anything.
+    var waiting: String?
     let isUnread: Bool
     let isWorking: Bool
     let isSelected: Bool
@@ -225,7 +235,7 @@ private struct MainBotTile: View {
                             // On the edge of the face, where a badge sits.
                             Circle().fill(theme.unread).frame(width: 10, height: 10)
                                 .offset(x: isCompact ? 1 : -3, y: isCompact ? 1 : 3)
-                                .accessibilityLabel("Unread")
+                                .accessibilityLabel(waiting == nil ? "Unread" : "Waiting for you")
                         }
                     }
                 if !isCompact {
@@ -247,7 +257,7 @@ private struct MainBotTile: View {
         }
         .buttonStyle(.plain)
         // In the rail its name is not written under it.
-        .accessibilityLabel(bot.title)
+        .accessibilityLabel(waiting.map { "\(bot.title), \($0)" } ?? bot.title)
         .onHover { isHovered = $0 }
         // A bot looks at the pointer only while the pointer is on that bot.
         .avatarsFollowPointer()
@@ -304,6 +314,7 @@ private struct HoverCard: View {
 private struct RailFace: View {
     let bot: Bot
     let look: AvatarLook
+    var waiting: String?
     let isUnread: Bool
     let isWorking: Bool
     let isSelected: Bool
@@ -313,6 +324,7 @@ private struct RailFace: View {
 
     var body: some View {
         let theme = Theme(scheme)
+        let tip = waiting.map { "\(bot.title) — \($0)" } ?? bot.title
         Button(action: select) {
             BotAvatar(look, size: 36, isWorking: isWorking)
                 .overlay(alignment: .bottomTrailing) {
@@ -321,7 +333,7 @@ private struct RailFace: View {
                         Circle().fill(theme.unread).frame(width: 9, height: 9)
                             .overlay(Circle().strokeBorder(theme.sidebar, lineWidth: 1.5))
                             .offset(x: 1, y: 1)
-                            .accessibilityLabel("Unread")
+                            .accessibilityLabel(waiting == nil ? "Unread" : "Waiting for you")
                     }
                 }
                 .frame(width: 56, height: 56)
@@ -335,8 +347,8 @@ private struct RailFace: View {
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
         .avatarsFollowPointer()
-        .help(bot.title)
-        .accessibilityLabel(bot.title)
+        .help(tip)
+        .accessibilityLabel(waiting.map { "\(bot.title), \($0)" } ?? bot.title)
     }
 }
 
@@ -370,6 +382,8 @@ private struct BotRow: View {
     let look: AvatarLook
     /// The last thing said, without the marks that lay a reply out: "## Plan" reads "Plan".
     let preview: String
+    /// What the bot is waiting on the person for, if anything.
+    var waiting: String?
     let isUnread: Bool
     let isWorking: Bool
     let isSelected: Bool
@@ -397,7 +411,7 @@ private struct BotRow: View {
                 if isUnread {
                     Circle().fill(theme.unread).frame(width: 8, height: 8)
                         .padding(.trailing, 4)
-                        .accessibilityLabel("Unread")
+                        .accessibilityLabel(waiting == nil ? "Unread" : "Waiting for you")
                 }
             }
             .padding(.horizontal, 10)

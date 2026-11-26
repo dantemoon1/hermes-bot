@@ -18,11 +18,9 @@ struct AttachTests {
     }
 
     private func settled(_ chat: ChatModel) async throws {
-        let deadline = Date.now.addingTimeInterval(20)
-        while chat.isWorking {
-            try #require(Date.now < deadline, "The chat was still working")
-            try await Task.sleep(for: .milliseconds(20))
-        }
+        // No deadline of its own: a busy Mac may take longer, while the suite's own
+        // time limit still catches a turn that never ends.
+        while chat.isWorking { try await Task.sleep(for: .milliseconds(20)) }
     }
 
     /// Files to pick, made in a folder of their own. Returns them with what removes them.

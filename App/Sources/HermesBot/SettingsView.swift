@@ -29,7 +29,7 @@ enum Appearance: String, CaseIterable, Identifiable {
 /// Settings, shown over the window.
 struct SettingsView: View {
     let roster: RosterModel
-    private let updates = UpdateCheck.shared
+    private let updates = Updates.shared
     let close: () -> Void
     @AppStorage(Appearance.key) private var appearance = Appearance.system
     @State private var isConfirmingSignOut = false
@@ -174,17 +174,33 @@ struct SettingsView: View {
                 if let current = updates.current {
                     theme.hairline.frame(height: 1)
                     HStack {
-                        Text(updates.available.map { "Version \($0.version) is available. You have \(current)." } ?? "Version \(current)")
-                            .font(.system(size: 13))
-                            .foregroundStyle(theme.secondaryText)
+                        Text("Version \(current)")
+                            .font(.system(size: 14))
+                            .foregroundStyle(theme.text)
                         Spacer(minLength: 12)
-                        if let newer = updates.available {
-                            pill("Download", theme) { openURL(newer.page) }
-                                .help("Opens the release on GitHub in your browser")
+                        if updates.isOn {
+                            pill("Check for Updates", theme, isEnabled: updates.canCheck) { updates.check() }
                         }
                     }
                     .padding(.horizontal, 14)
                     .frame(minHeight: 46)
+                    if updates.isOn {
+                        theme.hairline.frame(height: 1)
+                        HStack {
+                            Text("Check for updates automatically")
+                                .font(.system(size: 14))
+                                .foregroundStyle(theme.text)
+                            Spacer(minLength: 12)
+                            Toggle("Check for updates automatically", isOn: Bindable(updates).checksAutomatically)
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                                .controlSize(.mini)
+                                // Neutral: blue is for unread and selection.
+                                .tint(theme.secondaryText)
+                        }
+                        .padding(.horizontal, 14)
+                        .frame(minHeight: 46)
+                    }
                 }
             }
         }
@@ -237,25 +253,28 @@ struct SettingsView: View {
     }
 
     private func card(_ theme: Theme, @ViewBuilder content: () -> some View) -> some View {
-        content()
+        // One stack, so a card of several rows has one background and one edge, not one each.
+        VStack(alignment: .leading, spacing: 0, content: content)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(theme.bubble, in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(theme.bubbleEdge))
     }
 
-    private func pill(_ title: String, _ theme: Theme, action: @escaping () -> Void) -> some View {
+    private func pill(_ title: String, _ theme: Theme, isEnabled: Bool = true, action: @escaping () -> Void) -> some View {
         WhenHovered { isHovered in
             Button(action: action) {
                 Text(title)
                     .font(.system(size: 13))
-                    .foregroundStyle(theme.text)
+                    .foregroundStyle(isEnabled ? theme.text : theme.secondaryText)
                     .padding(.horizontal, 12)
                     .frame(height: 30)
-                    .background(isHovered ? theme.raisedHover : theme.raised, in: Capsule())
+                    // A control that is disabled does not answer the pointer.
+                    .background(isHovered && isEnabled ? theme.raisedHover : theme.raised, in: Capsule())
                     .overlay(Capsule().strokeBorder(theme.hairline))
             }
         }
         .buttonStyle(.plain)
+        .disabled(!isEnabled)
         .fixedSize()
     }
 }

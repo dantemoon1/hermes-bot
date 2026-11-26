@@ -31,7 +31,7 @@ struct FilesTests {
         #expect(try await roster.file(at: "/demo/beds.png", from: bot).data == picture.data)
         // One still on its way when the gateway is left hands nothing back: it would be
         // the old gateway's file, for whoever asks the next one for the same name.
-        let late = Task { try await roster.file(at: "/demo/endless.bin", from: bot) }
+        let late = Task { try await roster.file(at: "/demo/streamed.bin", from: bot) }
         try await Task.sleep(for: .milliseconds(30))
         await roster.signOut()
         await #expect(throws: GatewayError.notConnected) { try await late.value }
@@ -53,6 +53,7 @@ struct FilesTests {
         try await Task.sleep(for: .milliseconds(20))
         unwanted.cancel()
         await #expect(throws: CancellationError.self) { try await unwanted.value }
+        for task in slow { task.cancel() }
         for task in slow { _ = await task.result }
         // The places were given back: a fetch asked for now goes through.
         #expect(try await !roster.file(at: "/demo/beds.png", from: bot).data.isEmpty)
@@ -87,7 +88,7 @@ struct FilesTests {
         await #expect(throws: GatewayError.rejected(code: 413, message: "This file is too large to show here.")) {
             try await client.file(at: "/demo/endless.bin", forBot: "garden", limit: 50_000)
         }
-        #expect(try await client.file(at: "/demo/endless.bin", forBot: "garden", limit: 400_000).data.count == 200_000)
+        #expect(try await client.file(at: "/demo/streamed.bin", forBot: "garden", limit: 400_000).data.count == 200_000)
         // A token that is refused is that, and a file the gateway keeps to itself is that.
         let stranger = GatewayClient(endpoint: GatewayEndpoint(pretend.address)!, token: "wrong")
         await #expect(throws: GatewayError.unauthorized(gatewayUsesSignIn: false)) { try await stranger.file(at: "/demo/beds.png", forBot: "garden") }

@@ -33,10 +33,25 @@ final class RosterModel {
             refreshUnread()
             readSelected()
             lookedAgain()
+            if isLookedAt, let selectedID { alerts.clearBot(selectedID) }
         }
     }
     /// Bots that have said something since their chat was last looked at.
     private(set) var unread: Set<Bot.ID> = []
+    /// Incremented when the person opens a bot from a system notification, so panels close.
+    private(set) var notificationOpens = 0
+    /// Bot clicked in a notification before the roster loaded, selected once it does.
+    private var pendingNotificationBotID: Bot.ID?
+    /// Reopens the main window if the person closed it and clicked a system notification.
+    var reopenMainWindow: (() -> Void)? {
+        get { alerts.onReopenWindow }
+        set { alerts.onReopenWindow = newValue }
+    }
+    /// Tells the person outside the app when a bot is waiting on them while not in front.
+    private let alerts: WaitingAlerts
+    /// Questions already seen on this gateway (bounded), so reconnects or switching away do not re-alert.
+    private var seenQuestions: [String] = []
+    private var seenQuestionSet: Set<String> = []
     /// The window is in front, so the chat showing is being looked at.
     var isLookedAt = true {
         didSet {
@@ -45,6 +60,7 @@ final class RosterModel {
             if isLookedAt {
                 catchUpShowing()
                 lookedAgain()
+                alerts.appCameForward(selectedBotID: selectedID)
             }
         }
     }
@@ -310,8 +326,9 @@ final class RosterModel {
 
     init(
         gateway: (address: String, token: String)? = nil, store: GatewayStore? = nil, readsEnvironment: Bool = true,
-        hermesConnections: URL? = nil, hermesCommand: URL? = nil
+        hermesConnections: URL? = nil, hermesCommand: URL? = nil, alerts: WaitingAlerts = .silent()
     ) {
+        self.alerts = alerts
         // HERMES_BOT_HERMES names another command to ask, for trying "This Mac" during
         // development with a pretend one.
         let namedCommand = readsEnvironment ? ProcessInfo.processInfo.environment["HERMES_BOT_HERMES"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) } : nil
@@ -349,6 +366,17 @@ final class RosterModel {
         if given == nil, !self.store.hasGateway {
             phase = .needsSetup
             findSavedConnections()
+        }
+        self.alerts.onSelectBot = { [weak self] id in self?.openFromNotification(id) }
+    }
+
+    private func openFromNotification(_ id: String) {
+        if bots.contains(where: { $0.id == id && !deleting.contains($0.id) }) {
+            pendingNotificationBotID = nil
+            selectedID = id
+            notificationOpens += 1
+        } else if bots.isEmpty {
+            pendingNotificationBotID = id
         }
     }
 
@@ -462,6 +490,7 @@ final class RosterModel {
         let chat = ChatModel()
         chat.questions.memory = connectionMemory
         chat.questions.owner = bot.name
+        chat.questions.onChange = { [weak self] in self?.waitingChanged() }
         return chat
     }
 
@@ -479,7 +508,15 @@ final class RosterModel {
             bot.chat.map { (bot.id, ReplyFormat.preview(of: $0.preview)) }
         }, uniquingKeysWith: { first, _ in first })
         for bot in bots where chats[bot.id] == nil { chats[bot.id] = newChat(for: bot) }
+        if let pending = pendingNotificationBotID, !bots.isEmpty {
+            pendingNotificationBotID = nil
+            if bots.contains(where: { $0.id == pending && !deleting.contains($0.id) }) {
+                selectedID = pending
+                notificationOpens += 1
+            }
+        }
         refreshUnread()
+        waitingChanged()
         catchUpShowing()
     }
 
@@ -546,6 +583,10 @@ final class RosterModel {
     /// its turn until it settles, so one in an opening's snapshot taken before that end may be
     /// over, and is checked with the gateway; a card asked after it comes as its own request.
     private var turnsEndedUnclaimed: [String: Date] = [:]
+    /// Questions held back from a chat's opening until it is looked at again (#46), by live
+    /// session id. The one record of them: every turn end reaches it (`turnEnded`), so a
+    /// request it makes obsolete is never put up by the look or its fallback.
+    private var heldForRecheck: [String: [(question: BotQuestion, client: GatewayClient)]] = [:]
 
     /// A question the gateway said was over, by its id and, where the gateway named it, its chat.
     private struct EndedQuestion: Equatable {
@@ -571,8 +612,20 @@ final class RosterModel {
         // What was kept for cards heard in this chat before it was claimed is its bot's now.
         connectionMemory.adopt(session: open.sessionID,
                                ops: Set(open.waiting.map(\.id) + (unclaimed[open.sessionID] ?? []).map(\.question.id)), bot: bot.name)
-        let turnEnded = turnsEndedUnclaimed.removeValue(forKey: open.sessionID).map { Date.now.timeIntervalSince($0) < 30 } ?? false
+        // Kept for its 30 s, not used up by the first opening: every opening of this chat
+        // in that time may carry a snapshot from before the end (#46).
+        let turnEnded = turnsEndedUnclaimed[open.sessionID].map { Date.now.timeIntervalSince($0) < 30 } ?? false
+        if !turnEnded { turnsEndedUnclaimed[open.sessionID] = nil }
+        // A turn ended while this chat was opening, so the snapshot may be from before it and
+        // hold a question another app has since answered. Such questions are put up only if a
+        // fresh look at the chat, taken after that end was heard, still holds them (#46).
+        let recheck = turnEnded ? bots.first(where: { $0.id == bot.id })?.chat ?? bot.chat : nil
+        var toRecheck: [BotQuestion] = []
         for question in open.waiting where !endedLately.contains(where: { $0.names(question) }) {
+            if recheck != nil, !{ if case .connection = question.kind { true } else { false } }() {
+                toRecheck.append(question)
+                continue
+            }
             put(question, in: chat, on: client)
             // A turn ended while this chat was opening, and this card was not known to be its:
             // the gateway says whether it is still open, and one that is not is over here too.
@@ -589,6 +642,55 @@ final class RosterModel {
         where waiting.client === client && !endedLately.contains(where: { $0.names(waiting.question) }) {
             put(waiting.question, in: chat, on: client)
         }
+        if let recheck, !toRecheck.isEmpty {
+            var held = heldForRecheck[open.sessionID] ?? []
+            for question in toRecheck where !held.contains(where: { $0.question.id == question.id && $0.client === client }) {
+                held.append((question, client))
+            }
+            heldForRecheck[open.sessionID] = held
+            let ids = Set(toRecheck.map(\.id))
+            let thisLoad = loadCount
+            Task { [weak self] in await self?.recheck(ids, from: open, chat: recheck, of: bot, on: client, in: thisLoad) }
+        }
+    }
+
+    /// Opens a chat again to see which of the questions held back from its opening are still
+    /// asked, puts those up, and ends any of the others shown meanwhile by another way. Tried
+    /// twice; if the gateway cannot be asked at all they are put up, since a question lost is
+    /// worse than one already answered elsewhere (whose answer the gateway drops).
+    private func recheck(_ ids: Set<String>, from open: LiveChat, chat stored: BotChat, of bot: Bot,
+                         on client: GatewayClient, in thisLoad: Int) async {
+        var fresh: LiveChat?
+        for attempt in 0..<2 {
+            if attempt > 0 { try? await Task.sleep(for: .milliseconds(500)) }
+            guard thisLoad == loadCount, client === self.client else { return }
+            if let opened = try? await client.openChat(stored, profile: bot.name) {
+                fresh = opened
+                break
+            }
+        }
+        guard thisLoad == loadCount, client === self.client else { return }
+        // What is still held of this look's questions: a turn end meanwhile has let go of any
+        // request it made obsolete.
+        let session = open.sessionID
+        let left = heldForRecheck[session] ?? []
+        let held = left.filter { ids.contains($0.question.id) && $0.client === client }.map(\.question)
+        let rest = left.filter { !(ids.contains($0.question.id) && $0.client === client) }
+        heldForRecheck[session] = rest.isEmpty ? nil : rest
+        guard let chat = chats[bot.id], liveSessions[session]?.bot == bot.id else { return }
+        guard let fresh else {
+            for question in held where !endedLately.contains(where: { $0.names(question) }) { put(question, in: chat, on: client) }
+            return
+        }
+        // Opened again under another live id: taken up as any opening is.
+        guard fresh.sessionID == open.sessionID else { return chatOpened(fresh, of: bot, on: client) }
+        let still = Set(fresh.waiting.map(\.id))
+        for question in fresh.waiting where held.contains(where: { $0.id == question.id }) && !endedLately.contains(where: { $0.names(question) }) {
+            put(question, in: chat, on: client)
+        }
+        for question in held where !still.contains(question.id) {
+            chat.questions.ended(question.id, inSession: open.sessionID, on: client, reason: nil)
+        }
     }
 
     /// A turn has ended in a chat. Questions open in it that only the turn kept open are over;
@@ -597,14 +699,29 @@ final class RosterModel {
     func turnEnded(inSession session: String, on client: GatewayClient) {
         guard client === self.client else { return }
         for chat in chats.values { chat.questions.turnEnded(inSession: session, on: client) }
+        // Requests held for a look again are over too, as shown ones are; noted as ended so a
+        // snapshot taken before this end does not bring them back either.
+        if let held = heldForRecheck[session] {
+            let over = held.filter { if case .prompt = $0.question.route { false } else { $0.client === client } }
+            let kept = held.filter { entry in !over.contains { $0.question.id == entry.question.id && $0.client === entry.client } }
+            heldForRecheck[session] = kept.isEmpty ? nil : kept
+            endedLately = Array((endedLately + over.map { EndedQuestion(id: $0.question.id, session: session) }).suffix(200))
+        }
         guard liveSessions[session] == nil else { return }
         turnsEndedUnclaimed[session] = .now
         if turnsEndedUnclaimed.count > 50, let oldest = turnsEndedUnclaimed.min(by: { $0.value < $1.value })?.key { turnsEndedUnclaimed[oldest] = nil }
-        // The cards known for this chat were the ended turn's: over, by their own ids.
+        // The cards known for this chat were the ended turn's: over, by their own ids. So are
+        // requests heard before the chat was claimed, as `ChatQuestions.turnEnded` takes them
+        // for a chat that is shown: the older route drops one another app answered without a
+        // word, so one kept here could come back answered (#46). A session authority's prompt
+        // is settled by its own event and is kept.
         var over = Set(connectionUpdates.filter { $0.value.client === client && $0.value.session == session }.map(\.key))
         if let waiting = unclaimed[session] {
-            for entry in waiting { if case .connection = entry.question.kind { over.insert(entry.question.id) } }
-            let left = waiting.filter { if case .connection = $0.question.kind { false } else { true } }
+            for entry in waiting {
+                if case .prompt = entry.question.route { continue }
+                over.insert(entry.question.id)
+            }
+            let left = waiting.filter { if case .prompt = $0.question.route { true } else { false } }
             unclaimed[session] = left.isEmpty ? nil : left
         }
         endedLately = Array((endedLately + over.map { EndedQuestion(id: $0, session: session) }).suffix(200))
@@ -658,22 +775,86 @@ final class RosterModel {
             put(question, in: chat, on: client)
             return
         }
-        // Its chat is still being opened. Kept a little while, then refused: a question no
-        // chat here claims has nothing to answer it, and the bot should not wait it out.
+        // Its chat has not been opened here yet. Keep it and try to open its bot's chat in the
+        // background so it can be shown; only a question for a chat that belongs to no bot here
+        // (or cannot be opened) is declined once the wait and any claim under way end.
         var waiting = unclaimed[question.sessionID, default: []]
         guard !waiting.contains(where: { $0.question.id == question.id }) else { return }
+        let isFirstForSession = waiting.isEmpty
         waiting.append((question, client))
         if waiting.count > 10 { client.declineSoon(waiting.removeFirst().question) }
         unclaimed[question.sessionID] = waiting
+        unclaimedGeneration += 1
+        if isFirstForSession { claimUnclaimed(sessionID: question.sessionID, on: client) }
         let wait = unclaimedWait
+        let thisLoad = loadCount
         Task { [weak self] in
             try? await Task.sleep(for: wait)
-            guard let self, var left = self.unclaimed[question.sessionID],
+            guard let self else { return }
+            await self.waitForBackgroundClaims(in: thisLoad)
+            guard var left = self.unclaimed[question.sessionID],
                   let index = left.firstIndex(where: { $0.question.id == question.id && $0.client === client }) else { return }
             left.remove(at: index)
             self.unclaimed[question.sessionID] = left.isEmpty ? nil : left
             client.declineSoon(question)
         }
+    }
+
+    /// Tries to find which bot owns an unclaimed session and open its chat in the background,
+    /// so a question arriving for a chat not yet opened is shown instead of declined.
+    private func claimUnclaimed(sessionID: String, on client: GatewayClient) {
+        let thisLoad = loadCount
+        if let bot = bots.first(where: { $0.chat?.id == sessionID || $0.chat?.liveID == sessionID }) {
+            Task { [weak self] in await self?.openInBackground(bot, on: client, in: thisLoad) }
+            return
+        }
+        if bots.contains(where: { $0.chat != nil }) {
+            lookForQuestions(of: bots, everyBot: true)
+        } else if !bots.isEmpty {
+            refreshSoon()
+        }
+    }
+
+    /// Waits for any background look, roster refresh, or chat opening already under way for
+    /// `thisLoad`, so a question whose chat is being opened is not declined while in flight.
+    private func waitForBackgroundClaims(in thisLoad: Int) async {
+        while thisLoad == loadCount {
+            if let refreshing, refreshing.load == thisLoad {
+                await refreshing.task.value
+                continue
+            }
+            if let task = lookingTask, lookingIn == thisLoad {
+                await task.value
+                continue
+            }
+            if let opening = openingInBackground.values.first(where: { $0.load == thisLoad }) {
+                await opening.task.value
+                continue
+            }
+            break
+        }
+    }
+
+    /// Opens a bot's chat in the background to pick up any question waiting in it, joining an
+    /// opening already under way for the same bot, client, and target chat id.
+    private func openInBackground(_ bot: Bot, on client: GatewayClient, in thisLoad: Int) async {
+        guard let chat = bot.chat else { return }
+        if let existing = openingInBackground[bot.id],
+           existing.load == thisLoad, existing.client === client, existing.liveID == chat.liveID {
+            await existing.task.value
+            return
+        }
+        let task = Task { [weak self] in
+            guard let open = try? await client.openChat(chat, profile: bot.name),
+                  let self, thisLoad == self.loadCount, client === self.client,
+                  // A reply for a chat the bot has since moved on from (a newer chat opened
+                  // meanwhile) must not take the place of the newer one.
+                  self.bots.first(where: { $0.id == bot.id })?.chat?.liveID == chat.liveID else { return }
+            self.chatOpened(open, of: bot, on: client)
+        }
+        openingInBackground[bot.id] = (thisLoad, client, chat.liveID, task)
+        await task.value
+        if openingInBackground[bot.id]?.task == task { openingInBackground[bot.id] = nil }
     }
 
     /// The gateway says a question is over: only the one it names, in the chat it names.
@@ -698,6 +879,10 @@ final class RosterModel {
             let left = waiting.filter { $0.client !== client }
             return left.isEmpty ? nil : left
         }
+        heldForRecheck = heldForRecheck.compactMapValues { held in
+            let left = held.filter { $0.client !== client }
+            return left.isEmpty ? nil : left
+        }
         if client === self.client {
             endedLately = []
             turnsEndedUnclaimed = [:]
@@ -710,63 +895,100 @@ final class RosterModel {
     /// The load a look for chats that may be waiting on the person is under way in. One left
     /// from an earlier load, or another connection, holds nothing up.
     private var lookingIn: Int?
+    private var lookingTask: Task<Void, Never>?
     private var isLookingForQuestions: Bool { lookingIn == loadCount }
+    /// Chats being opened in the background to pick up waiting questions, keyed by bot, client
+    /// and target chat id so a replacement chat or new connection never joins a stale open.
+    private var openingInBackground: [Bot.ID: (load: Int, client: GatewayClient, liveID: String, task: Task<Void, Never>)] = [:]
+    /// Counts unclaimed questions added on this gateway and the latest generation for which a
+    /// roster refresh was already run, so each newly arrived unclaimed question gets one refresh
+    /// without looping on truly unknown sessions.
+    private var unclaimedGeneration = 0
+    private var unclaimedRefreshedThrough = 0
     /// Looks asked for while one was under way, made one: done when it ends, with the roster
     /// and the bot showing as they are then, so a bot listed meanwhile is not passed over.
-    private var lookAgain: (ids: Set<Bot.ID>, everyBot: Bool)?
+    private var lookAgain: (ids: Set<Bot.ID>, everyBot: Bool, including: Set<Bot.ID>)?
 
     /// Opens on the connection in use the chats of these bots whose agents are at work on the
     /// gateway, so that a question one of them is waiting on is shown without the person
     /// having to send anything (a question asked before this app was started, or in a turn
     /// begun elsewhere). Only chats the gateway lists as at work are opened, so no idle bot is
-    /// woken; one already open on this connection is left. A gateway that will not list them
-    /// is not asked to.
+    /// woken; one already attached on this connection is left unless it was replaced, released,
+    /// or missed a waiting question. A gateway that will not list them is not asked to.
     /// Where the session authority handles chats each bot is asked about on its own, so after
-    /// the first look only the bot showing is (`everyBot` false).
-    func lookForQuestions(of bots: [Bot], everyBot: Bool = true) {
+    /// the first look only the bot showing and any bot whose chat just changed are (`everyBot` false).
+    func lookForQuestions(of bots: [Bot], everyBot: Bool = true, including: Set<Bot.ID> = []) {
         // No chat to look at (as when the roster is not read yet): nothing to do, and nothing
         // held up by doing it.
         guard let client, !cannotListChatsAtWork, bots.contains(where: { $0.chat != nil }) else { return }
         guard !isLookingForQuestions else {
-            lookAgain = ((lookAgain?.ids ?? []).union(bots.map(\.id)), (lookAgain?.everyBot ?? false) || everyBot)
+            lookAgain = (
+                (lookAgain?.ids ?? []).union(bots.map(\.id)),
+                (lookAgain?.everyBot ?? false) || everyBot,
+                (lookAgain?.including ?? []).union(including)
+            )
             return
         }
         let thisLoad = loadCount
         let showing = selectedID
         lookingIn = thisLoad
-        Task {
+        lookingTask = Task {
             defer {
                 if lookingIn == thisLoad {
                     lookingIn = nil
+                    lookingTask = nil
                     if let again = lookAgain {
                         lookAgain = nil
-                        lookForQuestions(of: self.bots.filter { again.ids.contains($0.id) }, everyBot: again.everyBot)
+                        lookForQuestions(
+                            of: self.bots.filter { again.ids.contains($0.id) },
+                            everyBot: again.everyBot, including: again.including
+                        )
                     }
                 }
             }
             // Which way to ask is known only once the gateway has greeted this connection.
             let authority = await client.sessionAuthorityOnceGreeted()
-            let candidates = bots.filter { $0.chat != nil && (everyBot || !authority || $0.id == showing) }
+            let candidates = bots.filter { $0.chat != nil && (everyBot || !authority || $0.id == showing || including.contains($0.id)) }
             var atWork: [ChatAtWork] = []
-            do {
-                if authority {
-                    for bot in candidates { atWork += try await client.chatsAtWork(profile: bot.name) }
-                } else {
-                    atWork = try await client.chatsAtWork(profile: nil)
+            // One bot's list that could not be had does not hide what the others' say, nor
+            // the reading of the roster below for a question no list matched.
+            var someListFailed = false
+            for profile in authority ? candidates.map(\.name) : [nil] {
+                do {
+                    atWork += try await client.chatsAtWork(profile: profile)
+                } catch GatewayError.unsupported {
+                    if client === self.client { cannotListChatsAtWork = true }
+                    return
+                } catch {
+                    someListFailed = true
                 }
-            } catch GatewayError.unsupported {
-                if client === self.client { cannotListChatsAtWork = true }
-                return
-            } catch {
-                return
             }
             for bot in candidates {
                 guard thisLoad == loadCount, client === self.client, let chat = bot.chat else { return }
                 let ids: Set<String> = [chat.id, chat.liveID]
-                guard atWork.contains(where: { $0.mayBeAsking && (ids.contains($0.storedID) || ids.contains($0.id)) }),
-                      !liveSessions.values.contains(where: { $0.bot == bot.id && $0.client === client }) else { continue }
-                if let open = try? await client.openChat(chat, profile: bot.name), thisLoad == loadCount {
-                    chatOpened(open, of: bot, on: client)
+                guard let matched = atWork.first(where: {
+                    ($0.mayBeAsking || unclaimed[$0.id] != nil || unclaimed[$0.storedID] != nil) && (ids.contains($0.storedID) || ids.contains($0.id))
+                }) else { continue }
+                let attached = liveSessions[matched.id]?.bot == bot.id && liveSessions[matched.id]?.client === client
+                let missedWaiting = matched.status == "waiting" && !isWaiting(bot)
+                let movedElsewhere = including.contains(bot.id) && !isWorking(bot)
+                guard !attached || missedWaiting || movedElsewhere else { continue }
+                await openInBackground(bot, on: client, in: thisLoad)
+            }
+            // An unclaimed question in a brand-new chat not yet listed on our cached roster: read
+            // the roster once for the current unclaimed generation so that bot gets its chat and
+            // can be opened. On the session authority, bots without a chat were skipped above so
+            // `atWork` will not list them yet.
+            if unclaimedRefreshedThrough < unclaimedGeneration, thisLoad == loadCount, client === self.client, !unclaimed.isEmpty {
+                let unmatched = authority || someListFailed || atWork.contains { row in
+                    (unclaimed[row.id] != nil || unclaimed[row.storedID] != nil) && !self.bots.contains { bot in
+                        guard let chat = bot.chat else { return false }
+                        return chat.id == row.storedID || chat.liveID == row.storedID || chat.id == row.id || chat.liveID == row.id
+                    }
+                }
+                if unmatched {
+                    unclaimedRefreshedThrough = unclaimedGeneration
+                    _ = await refreshBots()
                 }
             }
         }
@@ -790,19 +1012,66 @@ final class RosterModel {
         }
     }
 
+    /// What a bot is waiting on the person for, if anything.
+    func waitingText(for bot: Bot) -> String? {
+        guard !deleting.contains(bot.id), let first = chats[bot.id]?.questions.open.first else { return nil }
+        return Self.waitingText(for: first.question.kind)
+    }
+
+    static func waitingText(for kind: BotQuestion.Kind) -> String {
+        switch kind {
+        case .approval: "Waiting for approval"
+        case .clarify: "Waiting for your answer"
+        case .secret: "Waiting for a secret"
+        case .sudo: "Waiting for a password"
+        case .connection: "Waiting to connect"
+        }
+    }
+
+    func isWaiting(_ bot: Bot) -> Bool {
+        !deleting.contains(bot.id) && chats[bot.id]?.questions.isWaiting == true
+    }
+
+    /// Whether a bot's row, tile, rail face or search result carries the blue dot: unread, or
+    /// waiting on an answer in a chat not currently in front of the person.
+    func showsDot(for bot: Bot) -> Bool {
+        unread.contains(bot.id) || (isWaiting(bot) && !(bot.id == selectedID && isLookedAt))
+    }
+
+    /// Every bot carrying a blue dot, for View Unread to step through.
+    var needsAttention: Set<Bot.ID> {
+        unread.union(bots.filter { isWaiting($0) && !($0.id == selectedID && isLookedAt) }.map(\.id))
+    }
+
     /// What a bot's row says under its name: what it is waiting on the person for, if
     /// anything, else the last thing said in its chat.
     func rowPreview(for bot: Bot) -> String {
-        if let first = chats[bot.id]?.questions.open.first {
-            switch first.question.kind {
-            case .approval: return "Waiting for approval"
-            case .clarify: return "Waiting for your answer"
-            case .secret: return "Waiting for a secret"
-            case .sudo: return "Waiting for a password"
-            case .connection: return "Waiting to connect"
+        waitingText(for: bot) ?? previews[bot.id] ?? ""
+    }
+
+    /// Keeps outside-the-app cues in step with every bot's open questions.
+    private func waitingChanged() {
+        var openKeys: Set<String> = []
+        for bot in bots where !deleting.contains(bot.id) {
+            guard let open = chats[bot.id]?.questions.open, !open.isEmpty else { continue }
+            for asked in open {
+                let key = "\(bot.id)\n\(asked.question.id)"
+                openKeys.insert(key)
+                if seenQuestionSet.insert(key).inserted {
+                    seenQuestions.append(key)
+                    if seenQuestions.count > 200 {
+                        seenQuestionSet.remove(seenQuestions.removeFirst())
+                    }
+                    if !isLookedAt {
+                        alerts.notify(WaitingAlerts.Notice(
+                            id: key, botID: bot.id, botTitle: bot.title,
+                            body: Self.waitingText(for: asked.question.kind)
+                        ))
+                    }
+                }
             }
         }
-        return previews[bot.id] ?? ""
+        alerts.reconcile(openIDs: openKeys)
     }
 
     /// The connection to the gateway a piece of work began on, or a failure if the app has
@@ -869,10 +1138,14 @@ final class RosterModel {
             if reading < readingShown { return true }
             if changes == changeCount {
                 readingShown = reading
+                let changed = Set(bots.filter { bot in
+                    guard let chat = bot.chat else { return false }
+                    return self.bots.first(where: { $0.id == bot.id })?.chat != chat
+                }.map(\.id))
                 take(bots)
                 // A chat changed: a bot at work may have begun to wait on the person. The one
-                // showing, or every bot where one look costs no more.
-                lookForQuestions(of: bots, everyBot: false)
+                // showing and any whose chat moved, or every bot where one look costs no more.
+                lookForQuestions(of: bots, everyBot: false, including: changed)
                 return true
             }
         }
@@ -1208,27 +1481,29 @@ final class RosterModel {
     private var watchWait = 3.0
     /// The gateway no longer takes the token, so the watch has stopped trying.
     private var tokenRefused = false
-    /// A reading of the roster asked for by the watch is under way, and whether another was
-    /// asked for meanwhile.
-    private var isRefreshing = false
-    private var refreshIsWanted = false
+    /// A reading of the roster asked for by the watch is under way (scoped to its load), and
+    /// whether another was asked for meanwhile within that load.
+    private var refreshing: (load: Int, task: Task<Void, Never>)?
+    private var refreshWantedIn: Int?
 
     /// Reads the roster again on the watch's behalf, in a task of its own, so that nothing
-    /// done to the watch can cut a reading short. Asks made while one is under way are
-    /// answered by one more reading after it.
+    /// done to the watch can cut a reading short. Asks made while one is under way for the
+    /// same load are answered by one more reading after it.
     private func refreshSoon() {
-        guard !isRefreshing else {
-            refreshIsWanted = true
+        let thisLoad = loadCount
+        if refreshing?.load == thisLoad {
+            refreshWantedIn = thisLoad
             return
         }
-        isRefreshing = true
-        Task {
+        var task: Task<Void, Never>?
+        task = Task {
             repeat {
-                refreshIsWanted = false
+                if refreshWantedIn == thisLoad { refreshWantedIn = nil }
                 await refreshBots()
-            } while refreshIsWanted
-            isRefreshing = false
+            } while refreshWantedIn == thisLoad && loadCount == thisLoad
+            if let task, refreshing?.task == task { refreshing = nil }
         }
+        if let task { refreshing = (thisLoad, task) }
     }
 
     /// Hears the gateway say that some chat has changed, and reads the roster again: this is
@@ -2219,11 +2494,17 @@ final class RosterModel {
         guard !deleting.contains(bot.id) else { return nil }
         let thisLoad = loadCount
         deleting.insert(bot.id)
+        waitingChanged()
         // Nothing more is noted on a bot on its way out.
         readSaves[bot.id]?.cancel()
         readSaves[bot.id] = nil
         // Only this gateway's: by then the app may be on another, with a bot of the same name.
-        defer { if thisLoad == loadCount { deleting.remove(bot.id) } }
+        defer {
+            if thisLoad == loadCount {
+                deleting.remove(bot.id)
+                waitingChanged()
+            }
+        }
         do {
             // After any change to it still being saved, so that cannot land on a bot of the
             // same name made later. Nothing new is taken for it from here on; see `update`.
@@ -2290,8 +2571,10 @@ final class RosterModel {
         // one that was still being fetched for it.
         files.removeAllObjects()
         filesEpoch += 1
+        chats[bot.id]?.questions.onChange = nil
         chats[bot.id]?.abandon()
         chats[bot.id] = nil
+        openingInBackground[bot.id] = nil
         // What was kept for its connection cards, which being shown as waiting kept from expiring.
         connectionMemory.forget(owner: bot.id)
         saving[bot.id] = nil
@@ -2314,6 +2597,7 @@ final class RosterModel {
         changeCount += 1
         bots.removeAll { $0.id == bot.id }
         looks[bot.id] = nil
+        waitingChanged()
         if selectedID == bot.id || selected == nil { selectedID = mainBot?.id ?? bots.first?.id }
     }
 
@@ -2357,13 +2641,27 @@ final class RosterModel {
         bots = []
         looks = [:]
         previews = [:]
-        for chat in chats.values { chat.questions.forget() }
+        for chat in chats.values {
+            chat.questions.onChange = nil
+            chat.questions.forget()
+        }
         chats = [:]
         liveSessions = [:]
         unclaimed = [:]
+        openingInBackground = [:]
+        lookingTask = nil
+        unclaimedGeneration = 0
+        unclaimedRefreshedThrough = 0
+        refreshing = nil
+        refreshWantedIn = nil
+        pendingNotificationBotID = nil
+        seenQuestions = []
+        seenQuestionSet = []
+        alerts.clearAll()
         connectionUpdates = [:]
         connectionMemory.clear()
         turnsEndedUnclaimed = [:]
+        heldForRecheck = [:]
         // A look asked for on the gateway being left is not for the next one.
         lookAgain = nil
         endedLately = []

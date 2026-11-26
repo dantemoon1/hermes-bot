@@ -284,6 +284,8 @@ struct PageTests {
         // again, which a page that came from nowhere could not survive.
         try await click(3)
         #expect(shown.opened.isEmpty)
+        for _ in 0..<200 where await shown.page("location.hash") != "#web" { try await Task.sleep(for: .milliseconds(25)) }
+        #expect(await shown.page("location.hash") == "#web")
         #expect(shown.view.url?.absoluteString == "about:blank#web")
         _ = await shown.page("location.reload(); 1")
         try await Task.sleep(for: .milliseconds(300))

@@ -448,33 +448,57 @@ extension ConnectionAnswer.Move: CustomStringConvertible, CustomDebugStringConve
 }
 
 extension GatewayClient {
-    /// The gateway no longer has the card's operation open (`unknown_operation`): it settled
+    /// The gateway no longer has the card's operation open (`UNKNOWN_OPERATION`): it settled
     /// and was closed, here or elsewhere, before this move reached it.
     public struct ConnectionOver: Error, Sendable, Equatable {}
 
+    /// The gateway refused a move or reissue on a connection card, carrying its structured
+    /// `error.data.reason` (`ConnectorErrorReason` in Hermes's `tui_gateway/contracts/connectors.py`).
+    public struct ConnectionRefusal: Error, Sendable, Equatable {
+        public let code: Int
+        public let reason: String?
+        public let message: String
+
+        public init(code: Int, reason: String?, message: String) {
+            self.code = code
+            self.reason = reason
+            self.message = message
+        }
+    }
+
+    /// Whether a 4004 refusal means the operation itself is gone (`UNKNOWN_OPERATION` in
+    /// `error.data.reason`, falling back to message text only when `reason` is absent).
+    private static func isOperationGone(_ rejection: Rejection) -> Bool {
+        guard rejection.code == 4004 else { return false }
+        if let reason = rejection.reason { return reason == "UNKNOWN_OPERATION" }
+        return !rejection.message.lowercased().contains("target")
+    }
+
     /// Makes the person's moves on a connection card, in the chat it was put in. Returns
     /// whether the card is now settled. Values typed go only into this request. Throws
-    /// `ConnectionOver` when the gateway has closed the card already.
+    /// `ConnectionOver` when the gateway has closed the card already, or `ConnectionRefusal`
+    /// when the gateway refuses the move.
     @discardableResult
     public func respond(to connection: ConnectionRequest, inSession sessionID: String, with answer: ConnectionAnswer, profile: String) async throws -> Bool {
         do {
-            let result = try await request("connection.respond", .object([
+            let result = try await requestWithReason("connection.respond", .object([
                 "profile": .string(profile),
                 "owner": .object(["type": .string("session"), "session_id": .string(sessionID)]),
                 "op_id": .string(connection.opID),
                 "result": answer.wire,
             ]), timeout: .seconds(60))
             return result["settled"] == .bool(true)
-        } catch GatewayError.rejected(code: 4004, _) {
-            throw ConnectionOver()
+        } catch let rejection as Rejection {
+            if Self.isOperationGone(rejection) { throw ConnectionOver() }
+            throw ConnectionRefusal(code: rejection.code, reason: rejection.reason, message: rejection.message)
         }
     }
 
     /// Whether the gateway still has this card open in the chat (`connectors.operation.status`).
-    /// Throws `GatewayError.unsupported` where it cannot say.
+    /// Throws `GatewayError.unsupported` where it cannot say, or `ConnectionRefusal` if refused.
     public func connectionIsOpen(_ opID: String, inSession sessionID: String, profile: String) async throws -> Bool {
         do {
-            let now = try await request("connectors.operation.status", .object([
+            let now = try await requestWithReason("connectors.operation.status", .object([
                 "profile": .string(profile),
                 "owner": .object(["type": .string("session"), "session_id": .string(sessionID)]),
                 "op_id": .string(opID),
@@ -484,8 +508,9 @@ extension GatewayClient {
                 throw GatewayError.unexpectedReply(method: "connectors.operation.status")
             }
             return !settled
-        } catch GatewayError.rejected(code: 4004, _) {
-            return false
+        } catch let rejection as Rejection {
+            if Self.isOperationGone(rejection) { return false }
+            throw ConnectionRefusal(code: rejection.code, reason: rejection.reason, message: rejection.message)
         }
     }
 
@@ -493,7 +518,8 @@ extension GatewayClient {
     /// `reconnect`, as Hermes's own cards do): a fresh sign-in link for a hosted app, the
     /// sign-in or install run again for an MCP server or catalog entry. Answers with the
     /// card as it now stands; a new link is in it, to be opened only when the person clicks.
-    /// Throws `ConnectionOver` when the gateway has closed the card already.
+    /// Throws `ConnectionOver` when the gateway has closed the card already, or
+    /// `ConnectionRefusal` when the gateway refuses the retry.
     public func retry(_ name: String, of connection: ConnectionRequest, inSession sessionID: String, profile: String) async throws -> ConnectionRequest? {
         // `connectors.connect` acts on whatever card is open in the chat now, so first make sure
         // it is still this one: a card settled elsewhere must not re-mint another's sign-in.
@@ -501,15 +527,16 @@ extension GatewayClient {
         // remains, which only the gateway could close.
         guard try await connectionIsOpen(connection.opID, inSession: sessionID, profile: profile) else { throw ConnectionOver() }
         do {
-            let result = try await request("connectors.connect", .object([
+            let result = try await requestWithReason("connectors.connect", .object([
                 "profile": .string(profile),
                 "owner": .object(["type": .string("session"), "session_id": .string(sessionID)]),
                 "connectors": .array([.string(name)]),
                 "reconnect": .bool(true),
             ]), timeout: .seconds(45))
             return ConnectionRequest(payload: result).flatMap { $0.opID == connection.opID ? $0 : nil }
-        } catch GatewayError.rejected(code: 4004, let message) where !message.lowercased().contains("target") {
-            throw ConnectionOver()
+        } catch let rejection as Rejection {
+            if Self.isOperationGone(rejection) { throw ConnectionOver() }
+            throw ConnectionRefusal(code: rejection.code, reason: rejection.reason, message: rejection.message)
         }
     }
 }

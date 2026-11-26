@@ -107,7 +107,10 @@ struct SearchView: View {
             for: query,
             // One being deleted is no longer something to go to.
             bots: roster.bots.filter { !roster.deleting.contains($0.id) }.map {
-                Palette.Entry(id: $0.id, title: $0.title, preview: roster.previews[$0.id] ?? "", also: "\($0.name) \($0.description)")
+                Palette.Entry(
+                    id: $0.id, title: $0.title, preview: roster.rowPreview(for: $0),
+                    also: "\($0.name) \($0.description) \(roster.previews[$0.id] ?? "")"
+                )
             },
             offer: offer
         )
@@ -234,7 +237,8 @@ struct SearchView: View {
                             Text(bot.title)
                                 .font(.system(size: 14, weight: .medium))
                                 .foregroundStyle(theme.text)
-                            if let preview = roster.previews[id], !preview.isEmpty {
+                            let preview = roster.rowPreview(for: bot)
+                            if !preview.isEmpty {
                                 Text(preview)
                                     .font(.system(size: 12.5))
                                     .foregroundStyle(theme.secondaryText)
@@ -254,10 +258,10 @@ struct SearchView: View {
                         .foregroundStyle(theme.text)
                 }
                 Spacer(minLength: 8)
-                if case .bot(let id) = item, roster.unread.contains(id) {
+                if case .bot(let id) = item, let bot = roster.bots.first(where: { $0.id == id }), roster.showsDot(for: bot) {
                     Circle().fill(theme.unread).frame(width: 8, height: 8)
                         .padding(.trailing, 4)
-                        .accessibilityLabel("Unread")
+                        .accessibilityLabel(roster.isWaiting(bot) ? "Waiting for you" : "Unread")
                 }
             }
             .padding(.horizontal, 12)

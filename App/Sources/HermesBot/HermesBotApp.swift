@@ -5,13 +5,15 @@ import SwiftUI
 
 @main
 struct HermesBotApp: App {
-    @State private var roster = RosterModel()
+    @State private var roster = RosterModel(alerts: .live())
     @State private var panel: Panel?
     @State private var showsDetails = false
     @AppStorage(Appearance.key) private var appearance = Appearance.system
     /// The roster as a rail of faces (⌘B), kept on this Mac.
     @AppStorage("compactSidebar") private var isCompact = false
     @AppStorage(TextZoom.key) private var zoom = 1.0
+    private let updates = Updates.shared
+    @Environment(\.openWindow) private var openWindow
 
     init() {
         // `--write-icon <folder>` draws the app's icon and leaves, for the script that
@@ -33,8 +35,18 @@ struct HermesBotApp: App {
                     AvatarGallery()
                 } else {
                     MainWindow(roster: roster, panel: $panel, showsDetails: $showsDetails, isCompact: $isCompact)
-                        .task { await roster.load() }
-                        .task { UpdateCheck.shared.start() }
+                        .task {
+                            roster.reopenMainWindow = {
+                                if !roster.isMakingBot { panel = nil }
+                                if !NSApp.windows.contains(where: { $0.canBecomeMain && $0.isVisible }) {
+                                    openWindow(id: "main")
+                                }
+                            }
+                            // A window opened again (from the Dock or a notification) finds the
+                            // roster already loaded and watched: reading it again would start a
+                            // new load and drop what the watch hears meanwhile.
+                            if roster.phase != .loaded { await roster.load() }
+                        }
                 }
             }
             // For screenshots in both appearances without changing the system setting.
@@ -44,6 +56,13 @@ struct HermesBotApp: App {
             )
         }
         .commands {
+            CommandGroup(after: .appInfo) {
+                // Only in a copy of the app that can install updates; see Updates.
+                if updates.isOn {
+                    Button("Check for Updates…") { updates.check() }
+                        .disabled(!updates.canCheck)
+                }
+            }
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") { panel = .settings }
                     .keyboardShortcut(",")
@@ -71,11 +90,11 @@ struct HermesBotApp: App {
                 Button(showsDetails ? "Hide Details" : "Show Details") { showsDetails.toggle() }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
                     .disabled(roster.phase == .needsSetup || roster.selected == nil || panel != nil)
-                // Goes to the next bot with something unread, in the roster's order.
+                // Goes to the next bot with something unread or waiting on the person, in the roster's order.
                 Button("View Unread") {
-                    if let id = BotOrder.nextUnread(after: roster.selectedID, in: roster.order, unread: roster.unread) { roster.selectedID = id }
+                    if let id = BotOrder.nextUnread(after: roster.selectedID, in: roster.order, unread: roster.needsAttention) { roster.selectedID = id }
                 }
-                .disabled(!canMove || BotOrder.nextUnread(after: roster.selectedID, in: roster.order, unread: roster.unread) == nil)
+                .disabled(!canMove || BotOrder.nextUnread(after: roster.selectedID, in: roster.order, unread: roster.needsAttention) == nil)
                 Divider()
                 Button("Actual Size") { zoom = 1 }
                     .keyboardShortcut("0")
@@ -320,6 +339,9 @@ struct MainWindow: View {
         .animation(.easeOut(duration: 0.2), value: showsRail)
         // `/model` and `/reasoning` in the message box, with nothing after them.
         .onChange(of: roster.detailsAsks) { showsDetails = true }
+        // Clicking a system notification closes any panel over the chat so the question shows,
+        // unless a bot is mid-creation (whose dialog holds its retry state).
+        .onChange(of: roster.notificationOpens) { if !roster.isMakingBot { panel = nil } }
         .ignoresSafeArea()
         .confirmationDialog(
             "Delete \(deleting?.title ?? "this bot")?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),

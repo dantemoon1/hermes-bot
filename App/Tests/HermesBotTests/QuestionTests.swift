@@ -1118,4 +1118,50 @@ struct QuestionTests {
         secondChat.questions.answer(asked.instance, with: .approval(.deny), for: secondBot)
         try await until("the other app to finish", within: 20) { !secondChat.isWorking }
     }
+
+    @Test func aRefusedReissueSaysWhyAndA4004TargetRefusalKeepsTheCardOpen() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+
+        // While a hosted link stays `initiated` (no 2 s failure race), a reissue is refused as LINK_STILL_VALID.
+        send("ask me connect", chat, bot, roster)
+        try await until("the first card") { card(chat) != nil }
+        let openAsked = try #require(card(chat)?.asked)
+        #expect(chat.questions.retry(openAsked.instance, row: "notion", for: bot))
+        try await until("the link-valid refusal") { chat.questions.cards.first?.problem != nil }
+        #expect(chat.questions.cards.first?.problem == "Couldn't try that again. That sign-in link is still active.")
+        chat.questions.respond(openAsked.instance, with: ConnectionAnswer(isContinue: true), for: bot)
+        try await until("the first card to settle") { chat.questions.cards.isEmpty }
+        try await until("the first turn to end", within: 20) { !chat.isWorking }
+
+        send("ask me connect reissuefail", chat, bot, roster)
+        try await until("the second card") { card(chat) != nil }
+        let asked = try #require(card(chat)?.asked)
+        try await until("the sign-in to fail") { row("notion", chat)?.state == .failed }
+
+        // A 5034 CONNECTOR_REQUEST_FAILED refusal uses plain wording rather than "doesn't understand".
+        #expect(chat.questions.retry(asked.instance, row: "notion", for: bot))
+        try await until("the reissue refusal") { chat.questions.cards.first?.problem != nil }
+        #expect(chat.questions.cards.first?.problem == "Couldn't try that again. The connector request failed.")
+
+        // A 4004 UNKNOWN_TARGET keeps the card open and names the problem.
+        #expect(chat.questions.retry(asked.instance, row: "missing", for: bot))
+        try await until("the target refusal") { chat.questions.cards.first?.problem != nil }
+        #expect(chat.questions.cards.first?.problem == "Couldn't try that again. That item isn't on this card.")
+        #expect(card(chat) != nil)
+
+        chat.questions.respond(asked.instance, with: ConnectionAnswer(isContinue: true), for: bot)
+        try await until("the card to settle") { chat.questions.cards.isEmpty }
+
+        // Check every Hermes refusal reason maps cleanly.
+        #expect(ChatQuestions.connectionProblem("Couldn't try that again.", for: GatewayClient.ConnectionRefusal(code: 4002, reason: "REISSUE_REFUSED", message: "The operation has settled.")) == "Couldn't try that again. This card has already finished.")
+        #expect(ChatQuestions.connectionProblem("Couldn't try that again.", for: GatewayClient.ConnectionRefusal(code: 4002, reason: "REISSUE_REFUSED", message: "This target cannot be run again.")) == "Couldn't try that again. Hermes won't run this item again.")
+        #expect(ChatQuestions.connectionProblem("Couldn't try that again.", for: GatewayClient.ConnectionRefusal(code: 4032, reason: "NEEDS_NOUS_AUTH", message: "Sign in to use connectors.")) == "Couldn't try that again. Connectors need you to sign in to your account again.")
+        #expect(ChatQuestions.connectionProblem("Couldn't try that again.", for: GatewayClient.ConnectionRefusal(code: 4031, reason: "CONNECTORS_UNAVAILABLE", message: "Connectors are not available in this session.")) == "Couldn't try that again. Connectors aren't available in this chat.")
+        #expect(ChatQuestions.connectionProblem("Couldn't try that again.", for: GatewayClient.ConnectionRefusal(code: 4030, reason: "ORG_ACCESS_DENIED", message: "raw")) == "Couldn't try that again. This account cannot manage connectors for this organization.")
+        #expect(ChatQuestions.connectionProblem("Couldn't try that again.", for: GatewayClient.ConnectionRefusal(code: 5033, reason: "UNSUPPORTED_RUNTIME", message: "raw")) == "Couldn't try that again. Connectors can only be set up on the computer the bot runs on.")
+        #expect(ChatQuestions.connectionProblem("Couldn't try that again.", for: GatewayClient.ConnectionRefusal(code: 4001, reason: "NOT_OWNER", message: "session ownership changed")) == "Couldn't try that again. This card comes from a chat that isn't open any more.")
+        #expect(ChatQuestions.connectionProblem("Couldn't try that again.", for: GatewayClient.ConnectionRefusal(code: 4001, reason: "not_found", message: "not_found")) == "Couldn't try that again. This chat is no longer open on the gateway.")
+        #expect(ChatQuestions.connectionProblem("Couldn't send that.", for: GatewayClient.ConnectionRefusal(code: 4001, reason: "invalid_params", message: "invalid_params")) == "Couldn't send that. The gateway refused that.")
+    }
 }

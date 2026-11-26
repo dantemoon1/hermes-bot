@@ -18,6 +18,9 @@ final class FakeGateway: @unchecked Sendable {
     /// Every frame the client sent that answered a request of ours (no method), oldest first.
     var responses: [[String: Any]] { queue.sync { answers } }
 
+    /// The method of every request received, oldest first.
+    var methods: [String] { queue.sync { requests.compactMap { $0["method"] as? String } } }
+
     /// The params of every request received for `method`, oldest first.
     func params(of method: String) -> [[String: Any]] {
         queue.sync { requests.filter { $0["method"] as? String == method }.map { $0["params"] as? [String: Any] ?? [:] } }
