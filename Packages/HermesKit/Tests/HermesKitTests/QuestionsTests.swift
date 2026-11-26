@@ -185,7 +185,7 @@ struct QuestionsTests {
         }
         let question = try #require(asked)
         #expect(question.id == "srq-a")
-        // The window request was answered with nothing, without the person seeing it.
+        // The window request was answered with nothing, without the owner seeing it.
         let deadline = Date.now.addingTimeInterval(3)
         while gateway.responses.isEmpty, Date.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
         #expect(gateway.responses.first?["id"] as? String == "srq-w")
@@ -243,6 +243,47 @@ struct QuestionsTests {
         let open = try await client.openChat(chat, profile: "default")
         #expect(open.waiting.map(\.kind) == [BotQuestion.Kind.sudo(command: "sudo ls")])
         // Told before the chat was opened, so its questions come here.
+        #expect(gateway.params(of: "client.capabilities").count == 1)
+    }
+
+    @Test func aFailedTellingIsTriedAgainBeforeAChatIsOpened() async throws {
+        let refusals = Calls()
+        let (gateway, endpoint) = try await FakeGateway.start { id, method in
+            if method == "client.capabilities", refusals.next() == 1 {
+                return [#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":5000,"message":"busy"}}"#]
+            }
+            if method == "session.resume" { return [#"{"jsonrpc":"2.0","id":\#(id),"result":{"session_id":"live-7"}}"#] }
+            return [#"{"jsonrpc":"2.0","id":\#(id),"result":{}}"#]
+        }
+        defer { gateway.stop() }
+        let client = GatewayClient(endpoint: endpoint, token: "t")
+        await client.answerQuestions()
+        await client.connect()
+        let chat = try json(#"{"id":"c7","preview":"","message_count":0}"#).decode(BotChat.self)
+        _ = try await client.openChat(chat, profile: "default")
+        // Refused once, said again, and only then the chat opened.
+        let order = gateway.methods.filter { $0 == "client.capabilities" || $0 == "session.resume" }
+        #expect(order == ["client.capabilities", "client.capabilities", "session.resume"])
+        _ = try await client.openChat(chat, profile: "default")
+        #expect(gateway.params(of: "client.capabilities").count == 2)
+    }
+
+    @Test func aGatewayThatDoesNotKnowTheTellingIsNotAskedAgain() async throws {
+        let (gateway, endpoint) = try await FakeGateway.start { id, method in
+            method == "client.capabilities"
+                ? [#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":-32601,"message":"unknown method"}}"#]
+                : [#"{"jsonrpc":"2.0","id":\#(id),"result":{"session_id":"live-7"}}"#]
+        }
+        defer { gateway.stop() }
+        let client = GatewayClient(endpoint: endpoint, token: "t")
+        await client.answerQuestions()
+        await client.connect()
+        let chat = try json(#"{"id":"c7","preview":"","message_count":0}"#).decode(BotChat.self)
+        _ = try await client.openChat(chat, profile: "default")
+        #expect(gateway.params(of: "client.capabilities").count == 1)
+        // Said again by the owner, as the roster does for every connection it uses: still not asked.
+        await client.answerQuestions()
+        _ = try await client.openChat(chat, profile: "default")
         #expect(gateway.params(of: "client.capabilities").count == 1)
     }
 
@@ -558,4 +599,52 @@ struct QuestionsTests {
         await client.connect()
         #expect(try await client.retry("notion", of: card, inSession: "live-1", profile: "default")?.seq == 2)
     }
+
+    @Test func a4004RefusalUsesStructuredReasonBeforeMessage() async throws {
+        let card = ConnectionRequest(opID: "op-r", seq: 1, deadline: nil, targets: [])
+        func client(connectError: String) async throws -> (FakeGateway, GatewayClient) {
+            let (gateway, endpoint) = try await FakeGateway.start { id, method in
+                if method == "connectors.operation.status" {
+                    return [#"{"jsonrpc":"2.0","id":\#(id),"result":{"op_id":"op-r","seq":1,"settled":false,"targets":[]}}"#]
+                }
+                return [#"{"jsonrpc":"2.0","id":\#(id),"error":\#(connectError)}"#]
+            }
+            let client = GatewayClient(endpoint: endpoint, token: "t")
+            await client.connect()
+            return (gateway, client)
+        }
+
+        // `data.reason` == UNKNOWN_OPERATION wins even when message text mentions "target".
+        let (g1, c1) = try await client(connectError: #"{"code":4004,"message":"target gone","data":{"reason":"UNKNOWN_OPERATION"}}"#)
+        defer { g1.stop() }
+        await #expect(throws: GatewayClient.ConnectionOver.self) {
+            _ = try await c1.retry("notion", of: card, inSession: "live-1", profile: "default")
+        }
+
+        // `data.reason` == UNKNOWN_TARGET keeps the card open even when message text omits "target".
+        let (g2, c2) = try await client(connectError: #"{"code":4004,"message":"Missing row","data":{"reason":"UNKNOWN_TARGET"}}"#)
+        defer { g2.stop() }
+        await #expect(throws: GatewayClient.ConnectionRefusal(code: 4004, reason: "UNKNOWN_TARGET", message: "Missing row")) {
+            _ = try await c2.retry("notion", of: card, inSession: "live-1", profile: "default")
+        }
+
+        // Without `data.reason`, falls back to checking message text for "target".
+        let (g3, c3) = try await client(connectError: #"{"code":4004,"message":"No such target on the open operation."}"#)
+        defer { g3.stop() }
+        await #expect(throws: GatewayClient.ConnectionRefusal(code: 4004, reason: nil, message: "No such target on the open operation.")) {
+            _ = try await c3.retry("notion", of: card, inSession: "live-1", profile: "default")
+        }
+
+        let (g4, c4) = try await client(connectError: #"{"code":4004,"message":"No open operation with that op_id."}"#)
+        defer { g4.stop() }
+        await #expect(throws: GatewayClient.ConnectionOver.self) {
+            _ = try await c4.retry("notion", of: card, inSession: "live-1", profile: "default")
+        }
+    }
+}
+
+private final class Calls: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func next() -> Int { lock.withLock { count += 1; return count } }
 }

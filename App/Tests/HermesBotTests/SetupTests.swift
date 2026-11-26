@@ -239,8 +239,13 @@ struct SetupTests {
         #expect(await roster.setUp(address: pretend.address, token: "demo") == nil)
 
         async let leaving: Void = roster.signOut()
-        await Task.yield()
-        #expect(roster.phase == .needsSetup)
+        // Wait until the leaving has begun: its first act is to show setup, before the
+        // Keychain is cleared. One yield may not be enough on a busy machine.
+        for _ in 0..<10_000 {
+            if roster.phase != .loaded { break }
+            await Task.yield()
+        }
+        #expect(roster.phase == .needsSetup, "the disconnecting never showed setup")
         #expect(await roster.setUp(address: pretend.address, token: "demo") == nil)
         await leaving
 

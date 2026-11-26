@@ -30,6 +30,10 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 TOKEN = "demo"
 NOW = time.time()
+STALE_RESUME = set()  # chats whose next opening hands back an approval already answered, after its turn's end
+STILL_ASKED = set()   # chats whose every opening holds that approval: it is still asked
+RESUMES = {}          # chat id -> how many times it was opened
+FAIL_RESUMES = {}     # chat id -> openings still to refuse after the late one; the first says another turn ended
 OPEN = {}       # chat id -> the sockets that have it open; a bot's answer goes to all of them
 BUSY = {}       # chat id -> a lock held while the bot answers, so a second message waits its turn
 STOPS = {}      # chat id -> set to stop the answer under way
@@ -524,13 +528,58 @@ class Handler(socketserver.StreamRequestHandler):
             return self.reply(200, {"status_down": STATUS_DOWN})
         if url.path == "/api/status" and STATUS_DOWN:
             return self.reply(503, {"detail": "Service Unavailable"})
+        if url.path == "/api/stale-resume":
+            # The next opening of this chat is answered late: its turn's end comes first, then
+            # a snapshot taken before that end, holding an approval another app has answered.
+            # With `keep=1` the approval is still asked, in every opening.
+            chat = query.get("chat", ["chat-garden"])[0]
+            STALE_RESUME.add(chat)
+            if query.get("keep", ["0"])[0] == "1":
+                STILL_ASKED.add(chat)
+            # With `failrecheck=1` the two openings after it are refused, and before the first
+            # refusal another turn of that chat ends.
+            if query.get("failrecheck", ["0"])[0] == "1":
+                FAIL_RESUMES[chat] = 2
+            return self.reply(200, {"stale": True})
         if url.path == "/api/let-go":
             # Every open chat let go of, as a gateway closes idle ones: no app hears what is
             # asked in them until it opens them again.
             OPEN.clear()
             return self.reply(200, {"let_go": True})
+        if url.path == "/api/ask":
+            # Runs a routine-like turn in a bot's chat that asks the requested question, even
+            # when no app has opened that chat yet. `push=1` also sends the frame directly to
+            # connected sockets so tests can exercise unclaimed live frames.
+            bot_name = query.get("bot", ["garden"])[0]
+            kind = query.get("kind", ["approve"])[0]
+            push = query.get("push", ["0"])[0] == "1"
+            short = query.get("short", ["0"])[0] == "1"
+            replace = query.get("replace", ["0"])[0] == "1"
+            # `fresh=1`: the bot's chat is brand new under an id no app has read yet.
+            fresh = query.get("fresh", ["0"])[0] == "1"
+            row = next((r for r in BOTS if r["name"] == bot_name), None)
+            if row is None:
+                return self.reply(404, {"detail": "Bot not found"})
+            if replace:
+                # Simulates chat compaction / canonical session replacement under a fresh id.
+                old = (row.get("canonical_session") or {}).get("id") or "chat-" + bot_name
+                chat_id = f"chat-{bot_name}-{next(ROW_IDS)}"
+                CHATS[chat_id] = list(CHATS.get(old, []))
+                row["canonical_session"] = {"id": old, "resolved_id": chat_id, "title": "Bot Chat", "preview": "", "last_active": time.time(), "message_count": len(CHATS[chat_id])}
+            elif fresh:
+                chat_id = f"chat-{bot_name}-{next(ROW_IDS)}"
+                CHATS[chat_id] = []
+                row["canonical_session"] = {"id": chat_id, "title": "Bot Chat", "preview": "", "last_active": time.time(), "message_count": 0}
+            else:
+                chat_id = (row.get("canonical_session") or {}).get("resolved_id") or (row.get("canonical_session") or {}).get("id") or "chat-" + bot_name
+                rows = CHATS.setdefault(chat_id, [])
+                if not row.get("canonical_session"):
+                    row["canonical_session"] = {"id": chat_id, "title": "Bot Chat", "preview": "", "last_active": time.time(), "message_count": len(rows)}
+            text = f"ask me {kind} quick" + (" short" if short else "")
+            self.start_routine_ask(chat_id, row, text, push=push)
+            return self.reply(200, {"started": True, "bot": bot_name, "chat_id": chat_id})
         if url.path == "/api/status":
-            return self.reply(200, {"version": VERSION, "auth_required": True, "auth_providers": ["session-token"], "interrupts": INTERRUPTS, "refreshes": REFRESHES, "order": ORDER, "answers": ANSWERS, "open_requests": len(REQUESTS)})
+            return self.reply(200, {"version": VERSION, "auth_required": True, "auth_providers": ["session-token"], "interrupts": INTERRUPTS, "refreshes": REFRESHES, "order": ORDER, "answers": ANSWERS, "open_requests": len(REQUESTS), "resumes": RESUMES})
         if url.path == "/api/auth/providers":
             # Like a real gateway that takes only a token: no ways of signing in are listed.
             return self.reply(200, {"providers": []})
@@ -570,15 +619,23 @@ class Handler(socketserver.StreamRequestHandler):
             if wanted == "/demo/kept.env":
                 return self.reply(403, {"detail": "Path is outside the managed read boundary"})
             if wanted.split("?")[0] == "/demo/endless.bin":
-                # Sent without saying how large it is, a piece at a time.
+                # Really endless: pieces are sent until the client goes away, with no size said.
                 self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n")
                 try:
-                    for _ in range(20):
+                    while True:
                         self.wfile.write(b"x" * 10_000)
                         self.wfile.flush()
                         time.sleep(0.005)
                 except OSError:
                     pass
+                return
+            if wanted == "/demo/streamed.bin":
+                # Finite, but sent without saying how large it is, a piece at a time.
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n")
+                for _ in range(20):
+                    self.wfile.write(b"x" * 10_000)
+                    self.wfile.flush()
+                    time.sleep(0.005)
                 return
             if wanted == "/demo/charts/slow.js":
                 # A file beside a page that takes its time.
@@ -670,10 +727,11 @@ class Handler(socketserver.StreamRequestHandler):
                     if not lock.locked():
                         continue
                     # The session authority lists one bot's chats: the one named, else the main bot's.
-                    owner = next((row["name"] for row in BOTS if (row.get("canonical_session") or {}).get("id") == chat_id), "default")
+                    owner = next((row["name"] for row in BOTS if chat_id in ((row.get("canonical_session") or {}).get("id"), (row.get("canonical_session") or {}).get("resolved_id"))), "default")
                     if BUSY_MODE == "authority" and owner != (params.get("profile") or "default"):
                         continue
-                    asking = any(e["chat"] == chat_id and not e["event"].is_set() for e in REQUESTS.values())
+                    asking = any(e["chat"] == chat_id and not e["event"].is_set() for e in REQUESTS.values()) \
+                        or any(c["chat"] == chat_id and not c["op"].get("settled") for c in CONNECTIONS.values())
                     rows.append({"id": "live-" + chat_id, "session_key": chat_id, "status": "waiting" if asking else "working", "title": "Bot Chat"})
                 if BUSY_MODE == "active-slow":
                     # "active-slow": the list is as it was when asked, and comes 4 s later, so
@@ -688,16 +746,21 @@ class Handler(socketserver.StreamRequestHandler):
                 else:
                     card = next((c for c in CONNECTIONS.values() if "live-" + c["chat"] == owner.get("session_id") and not c["op"].get("settled")), None)
                 if card is None or card["op"].get("settled") or owner.get("session_id") != "live-" + card["chat"]:
-                    # As the real gateway: a closed or unknown operation is unknown_operation.
-                    self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 4004, "message": "No open operation with that op_id."}})
+                    # As the real gateway: a closed or unknown operation is UNKNOWN_OPERATION.
+                    self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {
+                        "code": 4004, "message": "No open operation with that op_id.", "data": {"reason": "UNKNOWN_OPERATION"}
+                    }})
                     continue
                 if method == "connectors.operation.status":
                     self.result(frame, connection_view(card["op"]))
                     continue
                 if method == "connectors.connect":
-                    error = self.connection_retry(card, params.get("connectors") or [], params.get("reconnect"))
-                    if error:
-                        self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 4002, "message": error}})
+                    refusal = self.connection_retry(card, params.get("connectors") or [], params.get("reconnect"))
+                    if refusal:
+                        code, reason, message = refusal
+                        self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {
+                            "code": code, "message": message, "data": {"reason": reason}
+                        }})
                     else:
                         self.result(frame, connection_view(card["op"]))
                     continue
@@ -872,6 +935,12 @@ class Handler(socketserver.StreamRequestHandler):
                     self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 4000, "message": "title already in use"}})
                 else:
                     self.result(frame, {"ok": True})
+            elif method == "session.resume" and chat_id in CHATS and FAIL_RESUMES.get(chat_id, 0) > 0 and chat_id not in STALE_RESUME:
+                RESUMES[chat_id] = RESUMES.get(chat_id, 0) + 1
+                if FAIL_RESUMES[chat_id] == 2:
+                    self.send({"jsonrpc": "2.0", "method": "event", "params": {"type": "message.complete", "session_id": "live-" + chat_id, "payload": {"text": "", "status": "complete"}}})
+                FAIL_RESUMES[chat_id] -= 1
+                self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 5000, "message": "busy"}})
             elif method == "session.resume" and chat_id in CHATS:
                 OPEN.setdefault(chat_id, set()).add(self)
                 waiting = [entry for entry in REQUESTS.values() if entry["chat"] == chat_id and not entry["event"].is_set()]
@@ -883,6 +952,14 @@ class Handler(socketserver.StreamRequestHandler):
                 card = next((c for c in CONNECTIONS.values() if c["chat"] == chat_id and not c["op"].get("settled")), None)
                 if card is not None:
                     reply["pending_connection"] = connection_request_payload(card["op"])
+                RESUMES[chat_id] = RESUMES.get(chat_id, 0) + 1
+                stale = {"id": "srq-stale", "method": "approval", "params": {"session_id": "live-" + chat_id, "request_id": "a-stale", "command": "echo answered elsewhere"}}
+                if chat_id in STALE_RESUME:
+                    STALE_RESUME.discard(chat_id)
+                    self.send({"jsonrpc": "2.0", "method": "event", "params": {"type": "message.complete", "session_id": "live-" + chat_id, "payload": {"text": "", "status": "complete"}}})
+                    reply["open_requests"] = reply["open_requests"] + [stale]
+                elif chat_id in STILL_ASKED:
+                    reply["open_requests"] = reply["open_requests"] + [stale]
                 self.result(frame, reply)
             elif method == "image.attach_bytes" and chat_id in CHATS:
                 # A picture queued for the next message in this chat, as the real gateway does.
@@ -1180,11 +1257,12 @@ class Handler(socketserver.StreamRequestHandler):
 
         def emit(kind, payload):
             frame = {"jsonrpc": "2.0", "method": "event", "params": {"type": kind, "session_id": "live-" + chat_id, "payload": payload}}
-            for socket in list(OPEN.get(chat_id, ())):
+            dests = list(SOCKETS) if (getattr(self, "_push_unclaimed", False) and kind in ("connection.request", "approval.request", "clarify.request")) else list(OPEN.get(chat_id, ()))
+            for socket in dests:
                 try:
                     socket.send(frame)
                 except OSError:
-                    OPEN[chat_id].discard(socket)  # that app went away
+                    OPEN.get(chat_id, set()).discard(socket)  # that app went away
 
         emit("message.start", {})
         said, status = "", "complete"
@@ -1247,15 +1325,36 @@ class Handler(socketserver.StreamRequestHandler):
             rows.append(user_row(rows, turned))
             self.answer(chat_id, turned, stopped)
 
+    def start_routine_ask(self, chat_id, row, text, push=False):
+        """Runs a turn in a bot's chat as a routine does, updating the roster and notifying apps."""
+        lock = BUSY.setdefault(chat_id, threading.Lock())
+        stopped = STOPS.setdefault(chat_id, threading.Event())
+        CHATS[chat_id].append(user_row(CHATS[chat_id], "Routine check"))
+        row["canonical_session"].update(preview="Routine check", last_active=time.time(), message_count=len(CHATS[chat_id]))
+        def run():
+            with lock:
+                self._push_unclaimed = push
+                try:
+                    if not push:
+                        tell_all_sessions_changed()
+                    self.answer(chat_id, text, stopped)
+                finally:
+                    self._push_unclaimed = False
+        threading.Thread(target=run, daemon=True).start()
+
     def ask(self, chat_id, method, params, wait, emit, stopped, withdraw_after=None):
         """Puts a question to the apps with the chat open and waits for the first answer."""
         rid = "srq-" + uuid.uuid4().hex[:12]
         full = {"session_id": "live-" + chat_id, **params}
-        targets = [s for s in list(OPEN.get(chat_id, ())) if BUSY_MODE == "authority" or getattr(s, "answers", False)]
-        if not targets:
-            # As the real older route does for an app that never said it answers: no answer, at once.
-            ANSWERS.append({"method": method, "result": "unsent"})
-            return None
+        attached = list(OPEN.get(chat_id, ()))
+        if getattr(self, "_push_unclaimed", False):
+            targets = [s for s in list(SOCKETS) if BUSY_MODE == "authority" or getattr(s, "answers", False)]
+        else:
+            targets = [s for s in attached if BUSY_MODE == "authority" or getattr(s, "answers", False)]
+            if attached and not targets:
+                # As the real older route does for an app that never said it answers: no answer, at once.
+                ANSWERS.append({"method": method, "result": "unsent"})
+                return None
         entry = {"id": rid, "chat": chat_id, "method": method, "params": full, "kind": "request", "event": threading.Event(), "result": None}
         REQUESTS[rid] = entry
         for socket in targets:
@@ -1380,6 +1479,7 @@ class Handler(socketserver.StreamRequestHandler):
         - "signin": the hosted app's sign-in finishes by itself 3 s in, as the watcher sees it.
         - "expire": the hosted app's link runs out 2 s in (`expired`); Try again mints a fresh one.
         - "fail": the hosted app fails 2 s in, keeping its dead link on the row, as Hermes does.
+        - "reissuefail": like "fail", and retrying the hosted app is refused with 5034 (`CONNECTOR_REQUEST_FAILED`).
         - "installfail": the MCP install fails, and asks for its values again.
         - "authorize": an MCP server to authorize: its sign-in link is minted before the card
           ("authorizefail": it fails 2 s in, and approving it again mints a fresh link, as
@@ -1562,16 +1662,18 @@ class Handler(socketserver.StreamRequestHandler):
         """`connectors.connect` with `reconnect`: Try again on failed or expired rows (`run.reissue`)."""
         ANSWERS.append({"method": "connectors.connect", "connectors": names, "reconnect": bool(reconnect)})
         if not reconnect:
-            return "Connector parameters are invalid."
+            return (4000, "INVALID_PARAMS", "Connector parameters are invalid.")
         if any(not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", str(name)) for name in names):
             # The contract's `ConnectorSlug`: an MCP server's name with a dot is refused.
-            return "string_pattern_mismatch: connectors"
+            return (4000, "INVALID_PARAMS", "string_pattern_mismatch: connectors")
         with card["lock"]:
             rows = [next((r for r in card["op"]["targets"] if r["name"] == name), None) for name in names]
             if any(r is None for r in rows):
-                return "No such target on the open operation."
+                return (4004, "UNKNOWN_TARGET", "No such target on the open operation.")
             if any(r["state"] not in ("failed", "expired") for r in rows):
-                return "Reopen the stored link."
+                return (4002, "LINK_STILL_VALID", "Reopen the stored link.")
+            if "reissuefail" in card["text"]:
+                return (5034, "CONNECTOR_REQUEST_FAILED", "Connector request failed. Try again explicitly.")
             for row in rows:
                 if row["kind"] == "connector":
                     attempt = int(row["connect_url"].rsplit("=", 1)[-1]) + 1 if row.get("connect_url") else 2

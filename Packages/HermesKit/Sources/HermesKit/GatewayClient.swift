@@ -67,6 +67,9 @@ public actor GatewayClient {
     private var answersQuestions = false
     /// The telling of that on the socket now open, while it is under way or once done.
     private var advertising: Task<Void, Never>?
+    /// The gateway does not know `client.capabilities` at all, so it is not asked again on
+    /// this socket.
+    private var advertisingIsUnknown = false
     /// The gateway said it can put a session authority's clarifying questions as one set.
     public private(set) var asksQuestionsTogether = false
     /// The gateway said it counts a "not shown here" decline of a window's request, rather
@@ -195,6 +198,7 @@ public actor GatewayClient {
         asksQuestionsTogether = false
         declinesNotShown = false
         advertising = nil
+        advertisingIsUnknown = false
         isGreeted = false
         settingsPerBot = nil
         sockets += 1
@@ -224,12 +228,42 @@ public actor GatewayClient {
         listeners.removeAll()
     }
 
+    /// Structured JSON-RPC refusal carried internally so callers that read `error.data.reason`
+    /// need not guess from message text, while `request(...)` keeps throwing `GatewayError`.
+    struct Rejection: Error {
+        let code: Int
+        let reason: String?
+        let message: String
+    }
+
     /// Calls a gateway method and returns its result. Cancelling the calling task abandons the
     /// request at once; the gateway may still act on it.
     public func request(
         _ method: String,
         _ params: JSONValue = .object([:]),
         timeout: Duration = .seconds(30)
+    ) async throws -> JSONValue {
+        do {
+            return try await sendRequest(method, params, timeout: timeout)
+        } catch let rejection as Rejection {
+            throw GatewayError.rejected(code: rejection.code, message: rejection.message)
+        }
+    }
+
+    /// Calls a gateway method, throwing `Rejection` with `error.data.reason` on a non-`-32601`
+    /// JSON-RPC refusal.
+    func requestWithReason(
+        _ method: String,
+        _ params: JSONValue = .object([:]),
+        timeout: Duration = .seconds(30)
+    ) async throws -> JSONValue {
+        try await sendRequest(method, params, timeout: timeout)
+    }
+
+    private func sendRequest(
+        _ method: String,
+        _ params: JSONValue,
+        timeout: Duration
     ) async throws -> JSONValue {
         try Task.checkCancellation()
         guard let socket else { throw lastFailure ?? .notConnected }
@@ -335,10 +369,13 @@ public actor GatewayClient {
             // Only a real reply may use up a waiting request: no method, and a result or error.
             if let error = frame["error"], error != .null {
                 let code = error["code"]?.numberValue.flatMap(Int.init(exactly:)) ?? 0
+                let message = error["message"]?.stringValue ?? "The gateway reported an error."
+                let reason = error["data"]?["reason"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
                 // -32601 is JSON-RPC's "method not found".
-                continuation.resume(throwing: code == -32601 ? GatewayError.unsupported(method: method) : .rejected(
+                continuation.resume(throwing: code == -32601 ? GatewayError.unsupported(method: method) : Rejection(
                     code: code,
-                    message: error["message"]?.stringValue ?? "The gateway reported an error."
+                    reason: reason,
+                    message: message
                 ))
             } else {
                 continuation.resume(returning: frame["result"] ?? .null)
@@ -352,20 +389,32 @@ public actor GatewayClient {
     /// each socket, after its greeting.
     public func answerQuestions() {
         answersQuestions = true
-        if isGreeted, socket != nil, advertising == nil { advertise() }
+        if isGreeted, socket != nil, advertising == nil, !advertisingIsUnknown { advertise() }
     }
 
-    private func advertise() {
+    private func advertise(timeout: Duration = .seconds(30)) {
+        let onSocket = sockets
         advertising = Task { [weak self] in
             guard let self else { return }
-            let said = try? await self.request("client.capabilities", .object(["server_requests": .bool(true)]))
-            await self.advertised(said)
+            do {
+                let said = try await self.request("client.capabilities", .object(["server_requests": .bool(true)]), timeout: timeout)
+                await self.advertised(said, on: onSocket)
+            } catch {
+                await self.advertised(nil, on: onSocket, unknown: (error as? GatewayError).map { if case .unsupported = $0 { true } else { false } } ?? false)
+            }
         }
     }
 
-    private func advertised(_ result: JSONValue?) {
-        // Not said after all: it can be said again on this socket.
-        if result == nil { advertising = nil }
+    /// What came of saying it on socket number `onSocket`; nothing, if another socket has
+    /// opened since, so a late failure never undoes what the new socket said.
+    private func advertised(_ result: JSONValue?, on onSocket: Int, unknown: Bool = false) {
+        guard onSocket == sockets else { return }
+        // Not said after all: it can be said again on this socket, unless the gateway does
+        // not know the method at all.
+        if result == nil {
+            advertising = nil
+            advertisingIsUnknown = unknown
+        }
         asksQuestionsTogether = result?["canonical_clarify_batch"] == .bool(true)
         declinesNotShown = result?["declines_not_shown"] == .bool(true)
     }
@@ -419,10 +468,34 @@ public actor GatewayClient {
 
     /// Waits until the gateway has been told this app answers requests, so a chat opened
     /// after it is one whose questions come here.
+    /// A telling that failed on the socket now open (a refusal, or no answer in time) is
+    /// tried again, twice at most, before the chat is opened: a chat opened while the
+    /// gateway thinks nobody here answers has its questions treated as unanswered at once.
+    /// A socket opened meanwhile is waited on afresh: its greeting, and the telling it starts.
+    /// Retries are given a short wait each, so a gateway that does not answer at all holds
+    /// up the opening little longer than before.
     func questionsAdvertised() async {
-        _ = await interfaceKindOnceGreeted()
-        await advertising?.value
+        var retries = 0
+        var retriesOn = sockets
+        while true {
+            _ = await interfaceKindOnceGreeted()
+            await advertising?.value
+            // A new socket is a new telling, with its own retries.
+            if retriesOn != sockets {
+                retriesOn = sockets
+                retries = 0
+            }
+            guard answersQuestions, advertising == nil, isGreeted, socket != nil, !advertisingIsUnknown,
+                  retries < Self.advertiseRetries else { return }
+            retries += 1
+            let onSocket = sockets
+            try? await Task.sleep(for: .milliseconds(150 * retries))
+            guard onSocket == sockets, advertising == nil, socket != nil, isGreeted, !advertisingIsUnknown else { continue }
+            advertise(timeout: .seconds(5))
+        }
     }
+
+    static let advertiseRetries = 2
 
     /// Answers a request from the gateway. The gateway does not reply to an answer.
     func respond(to id: JSONValue, with result: JSONValue) async throws {
