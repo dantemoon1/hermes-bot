@@ -333,4 +333,229 @@ struct QuestionsTests {
                                  kind: .approval(Approval(subject: .command("ls"), choices: [.once, .deny])))
         #expect(try await client.answer(prompt, with: .approval(.once), profile: "default") == false)
     }
+
+    // MARK: Connection cards
+
+    @Test func aConnectionCardIsRead() throws {
+        let event = GatewayEvent(type: "connection.request", payload: try json(#"""
+        {"op_id":"op-1","seq":2,"deadline_at":2000000000,"timeout_seconds":300,"targets":[
+          {"name":"notion","kind":"connector","action":"connect","state":"pending","display":"Notion","connect_url":"https://auth.example.com/x","tools":["a","b"]},
+          {"name":"fs","kind":"mcp","action":"install","state":"failed","detail":"bad key","tier":"community",
+           "launch":{"kind":"stdio","target":"npx fs"},"scan":{"status":"warnings","summary":"network use"},
+           "required_env":[{"name":"ROOT","required":true,"secret":false,"default":"/d"},{"name":"KEY","required":true,"secret":true,"default":""}]},
+          {"name":"odd","kind":"spaceship","action":"connect","state":"pending"}]}
+        """#), sessionID: "live-1")
+        let question = try #require(BotQuestion(event))
+        #expect(question.route == .connection)
+        #expect(question.id == "op-1")
+        guard case .connection(let card) = question.kind else { Issue.record("not a card"); return }
+        #expect(card.seq == 2)
+        #expect(card.deadline == Date(timeIntervalSince1970: 2_000_000_000))
+        // A row of a kind this app does not know is left out rather than guessed at.
+        #expect(card.targets.map(\.name) == ["notion", "fs"])
+        #expect(card.targets[0].connectURL?.host == "auth.example.com")
+        #expect(card.targets[1].fields.map(\.isSecret) == [false, true])
+        #expect(card.targets[1].launch == ConnectionTarget.Launch(isRemote: false, target: "npx fs"))
+        #expect(card.targets[1].scan == "warnings: network use")
+        #expect(!card.targets[1].isResolved)
+        // No chat named: not put up.
+        #expect(BotQuestion(GatewayEvent(type: "connection.request", payload: event.payload)) == nil)
+    }
+
+    @Test func onlyASafeSignInAddressIsOffered() {
+        #expect(ConnectionTarget.openable("https://auth.example.com/oauth?x=1") != nil)
+        #expect(ConnectionTarget.openable("http://127.0.0.1:8123/callback") != nil)
+        for unsafe in ["http://auth.example.com/", "file:///etc/passwd", "javascript:alert(1)", "hermes-bot://x",
+                       "https://user:pass@auth.example.com/", "https:///nohost", "not a url"] {
+            #expect(ConnectionTarget.openable(unsafe) == nil, "\(unsafe)")
+        }
+    }
+
+    @Test func movesOnACardAreShapedAsTheGatewayReadsThem() throws {
+        let answer = ConnectionAnswer(moves: ["notion": .skip, "fs": .approve(values: ["KEY": "s3cret"])], isContinue: true)
+        let wire = answer.wire
+        #expect(wire["settled_by"] == .string("continue"))
+        guard case .array(let rows)? = wire["targets"] else { Issue.record("no rows"); return }
+        #expect(rows.contains(.object(["name": .string("notion"), "status": .string("skipped")])))
+        #expect(rows.contains(.object(["name": .string("fs"), "status": .string("approved"), "env": .object(["KEY": .string("s3cret")])])))
+        // Never the values typed.
+        var dumped = ""
+        dump(answer, to: &dumped)
+        #expect(!dumped.contains("s3cret") && !String(describing: answer).contains("s3cret"))
+    }
+
+    @Test func aSnapshotGivesBackAnOpenConnectionCard() async throws {
+        let snapshot = try json(#"{"pending_connection":{"op_id":"op-9","seq":1,"targets":[]}}"#)
+        let client = GatewayClient(endpoint: try #require(GatewayEndpoint("127.0.0.1:1")), token: "t")
+        let waiting = await client.takeWaiting(in: snapshot, sessionID: "live-3")
+        #expect(waiting.map(\.id) == ["op-9"])
+        #expect(waiting.first?.route == .connection)
+    }
+
+    private func card(_ text: String) throws -> ConnectionRequest {
+        try #require(ConnectionRequest(payload: try json(text)))
+    }
+
+    @Test func aRowNamedTwiceIsTakenOnceAndAFieldNamedTwiceIsSecret() throws {
+        let card = try card(#"""
+        {"op_id":"op-2","seq":1,"targets":[
+          {"name":"fs","kind":"mcp","action":"install","state":"pending","launch":{"kind":"stdio","target":"npx fs"},
+           "required_env":[{"name":"KEY","required":false,"secret":false,"default":"shown"},{"name":"KEY","required":true,"secret":true,"default":"hidden"}]},
+          {"name":"fs","kind":"connector","action":"connect","state":"pending"}]}
+        """#)
+        #expect(card.targets.map(\.kind) == [.mcp])
+        let field = try #require(card.targets.first?.fields.first)
+        #expect(card.targets.first?.fields.count == 1)
+        // Secret and required if either says so; a secret keeps no default, so nothing unseen is sent.
+        #expect(field.isSecret && field.isRequired)
+        #expect(field.defaultValue == "")
+        #expect(field.value(typed: nil) == "")
+        #expect(!field.isFilled(typed: nil))
+    }
+
+    @Test func aSecretFieldNeverKeepsItsDefault() throws {
+        let card = try card(#"""
+        {"op_id":"op-3","seq":1,"targets":[{"name":"fs","kind":"mcp","action":"install","state":"pending",
+          "required_env":[{"name":"ROOT","required":true,"secret":false,"default":"/d"},{"name":"KEY","required":true,"secret":true,"default":"sk-live-x"}]}]}
+        """#)
+        let fields = try #require(card.targets.first?.fields)
+        #expect(fields[0].value(typed: nil) == "/d" && fields[0].isFilled(typed: nil))
+        #expect(!fields[0].isFilled(typed: "   "))
+        #expect(fields[1].value(typed: nil) == "" && !fields[1].isFilled(typed: nil))
+        #expect(fields[1].value(typed: "typed") == "typed")
+    }
+
+    @Test func whatIsResolvedIsTheGatewaysWord() throws {
+        let card = try card(#"""
+        {"op_id":"op-4","seq":3,"targets":[
+          {"name":"a","kind":"connector","action":"connect","state":"expired"},
+          {"name":"b","kind":"plugin","action":"install","state":"failed"},
+          {"name":"c","kind":"mcp","action":"install","state":"failed"},
+          {"name":"d","kind":"connector","action":"connect","state":"initiated","resolved":true}]}
+        """#)
+        // An expired sign-in waits on the person; a failed catalog row is done; the gateway's flag wins.
+        #expect(card.targets.map(\.isResolved) == [false, true, false, true])
+    }
+
+    @Test func eachRowOffersOnlyWhatHermesWouldTake() throws {
+        let card = try card(#"""
+        {"op_id":"op-5","seq":1,"targets":[
+          {"name":"hosted","kind":"connector","action":"connect","state":"initiated","connect_url":"https://auth.example.com/1"},
+          {"name":"installing","kind":"mcp","action":"install","state":"initiated","launch":{"kind":"stdio","target":"npx x"}},
+          {"name":"minting","kind":"mcp","action":"authorize","state":"pending"},
+          {"name":"dead","kind":"connector","action":"connect","state":"failed","connect_url":"https://auth.example.com/old"},
+          {"name":"late","kind":"connector","action":"connect","state":"expired"},
+          {"name":"fresh","kind":"mcp","action":"install","state":"pending","launch":{"kind":"stdio","target":"npx y","cwd":"/w","env":["A","B"]}},
+          {"name":"blind","kind":"mcp","action":"install","state":"pending"},
+          {"name":"unpinned","kind":"plugin","action":"install","state":"pending","repo":"github.com/x/y"},
+          {"name":"pinned","kind":"plugin","action":"install","state":"pending","repo":"github.com/x/y","sha":"0123456789abcdef0123456789abcdef01234567","subdir":"p","target_profile":"default","platforms":["macos"],"tier":"made-up"}]}
+        """#)
+        let row = { (name: String) in card.targets.first { $0.name == name }! }
+        #expect(row("hosted").move == .open(URL(string: "https://auth.example.com/1")!))
+        // Installing: the gateway is at work, and there is nothing to press.
+        #expect(row("installing").move == .none)
+        // An authorize still minting its link has nothing to approve.
+        #expect(row("minting").move == .none)
+        // A failed sign-in's old link is dead: it is tried again, not reopened.
+        #expect(row("dead").move == .retry)
+        #expect(row("late").move == .retry)
+        #expect(row("fresh").move == .approve && row("fresh").canBeApproved)
+        #expect(row("fresh").launch == ConnectionTarget.Launch(isRemote: false, target: "npx y", cwd: "/w", env: ["A", "B"]))
+        // What would run cannot be shown: not offered.
+        #expect(!row("blind").canBeApproved)
+        #expect(!row("unpinned").canBeApproved)
+        #expect(row("pinned").canBeApproved)
+        #expect(row("pinned").source == ConnectionTarget.Source(repo: "github.com/x/y", sha: "0123456789abcdef0123456789abcdef01234567", subdir: "p", targetProfile: "default", platforms: ["macos"]))
+        // A tier the contract does not name is not shown.
+        #expect(row("pinned").tier == nil)
+    }
+
+    @Test func aDeadlineThatMakesNoSenseIsNone() throws {
+        for value in ["1e300", "-5", "\"soon\"", "99999999999999"] {
+            let read = try card(#"{"op_id":"op-6","seq":1,"deadline_at":"# + value + "}")
+            #expect(read.deadline == nil, "\(value)")
+        }
+        #expect(try card(#"{"op_id":"op-6","seq":1e300,"targets":[]}"#).seq == 0)
+    }
+
+    @Test func anUpdateKeepsWhatOnlyTheRequestSaid() throws {
+        let request = try card(#"{"op_id":"op-7","seq":1,"targets":[],"display":{"suggested":["notion"]}}"#)
+        let settled = try card(#"{"op_id":"op-7","seq":2,"settled":true,"settled_by":"continue","targets":[]}"#)
+        let now = try #require(request.updated(by: settled))
+        #expect(now.suggested == ["notion"] && now.isSettled)
+        // Not newer: moves nothing.
+        #expect(now.updated(by: request) == nil)
+        #expect(request.updated(by: try card(#"{"op_id":"op-7","seq":1,"targets":[]}"#)) == nil)
+    }
+
+    @Test func aMoveNeverShowsTheValuesTyped() {
+        let move = ConnectionAnswer.Move.approve(values: ["KEY": "s3cret"])
+        var dumped = ""
+        dump(move, to: &dumped)
+        #expect(!dumped.contains("s3cret") && !String(describing: move).contains("s3cret") && !String(reflecting: move).contains("s3cret"))
+    }
+
+    @Test func whatIsNotUnderstoodIsTakenTheSaferWay() throws {
+        let card = try card(#"""
+        {"op_id":"op-8","seq":2.6,"targets":[
+          {"name":"fs","kind":"mcp","action":"install","state":"pending","launch":{"kind":"spaceship","target":"npx fs"},
+           "scan":{"status":"  "},
+           "required_env":[{"name":"A","required":true,"secret":"true","default":"leak"},{"name":"B","required":true,"default":"x"},
+                           {"name":"C","required":false,"secret":false,"default":"/d","prompt":"  "}]},
+          {"name":"short","kind":"plugin","action":"install","state":"pending","repo":"github.com/x/y","sha":"0123abc"}]}
+        """#)
+        // A seq that is not a whole number is no seq at all, rather than one rounded up.
+        #expect(card.seq == 0)
+        let fs = card.targets[0]
+        // A launch of a kind the contract does not name is not described, so not approved.
+        #expect(fs.launch == nil && !fs.canBeApproved)
+        #expect(fs.scan == nil)
+        // A field is plain only where it plainly says so; a secret keeps no default.
+        #expect(fs.fields.map(\.isSecret) == [true, true, false])
+        #expect(fs.fields[0].defaultValue == "" && fs.fields[1].defaultValue == "")
+        #expect(fs.fields[2].prompt == nil)
+        // A commit that is not a full one cannot pin the install.
+        #expect(card.targets[1].source?.pinnedCommit == nil && !card.targets[1].canBeApproved)
+    }
+
+    @Test func aRowConnectedWithSomethingAmissSaysSo() throws {
+        let card = try card(#"""
+        {"op_id":"op-9","seq":4,"targets":[
+          {"name":"cal","kind":"mcp","action":"authorize","state":"connected","discovery_error":"tools/list failed"},
+          {"name":"charts","kind":"plugin","action":"install","state":"connected","missing_env":["CHARTS_TOKEN"],"enabled":false},
+          {"name":"fine","kind":"mcp","action":"install","state":"connected","tools":["a"]}]}
+        """#)
+        #expect(card.targets[0].caveat == "its tools couldn't be listed")
+        #expect(card.targets[1].caveat == "it still needs CHARTS_TOKEN; it isn't turned on")
+        #expect(card.targets[2].caveat == nil)
+    }
+
+    @Test func fieldsAskedForAtDifferentTimesAreOneList() {
+        let first = [ConnectionTarget.Field(name: "A", isRequired: true, isSecret: true), ConnectionTarget.Field(name: "B", isRequired: true, isSecret: true)]
+        let later = [ConnectionTarget.Field(name: "B", isRequired: true, isSecret: false, defaultValue: "shown")]
+        let all = ConnectionTarget.merged(first, with: later)
+        #expect(all.map(\.name) == ["A", "B"])
+        #expect(all[1].isSecret && all[1].defaultValue == "")
+    }
+
+    @Test func retryGoesOnlyWhenTheGatewaySaysThatVeryCardIsOpen() async throws {
+        let card = ConnectionRequest(opID: "op-r", seq: 1, deadline: nil, targets: [])
+        for status in [#"{}"#, #"{"op_id":"op-other","settled":false}"#, #"{"op_id":"op-r"}"#] {
+            let (gateway, endpoint) = try await FakeGateway.start { id, method in
+                [#"{"jsonrpc":"2.0","id":\#(id),"result":\#(method == "connectors.operation.status" ? status : #"{"op_id":"op-r","seq":2,"targets":[]}"#)}"#]
+            }
+            defer { gateway.stop() }
+            let client = GatewayClient(endpoint: endpoint, token: "t")
+            await client.connect()
+            await #expect(throws: GatewayError.self, "\(status)") { _ = try await client.retry("notion", of: card, inSession: "live-1", profile: "default") }
+            #expect(gateway.params(of: "connectors.connect").isEmpty, "\(status)")
+        }
+        let (gateway, endpoint) = try await FakeGateway.start { id, method in
+            [#"{"jsonrpc":"2.0","id":\#(id),"result":\#(method == "connectors.operation.status" ? #"{"op_id":"op-r","settled":false}"# : #"{"op_id":"op-r","seq":2,"targets":[]}"#)}"#]
+        }
+        defer { gateway.stop() }
+        let client = GatewayClient(endpoint: endpoint, token: "t")
+        await client.connect()
+        #expect(try await client.retry("notion", of: card, inSession: "live-1", profile: "default")?.seq == 2)
+    }
 }

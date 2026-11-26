@@ -397,6 +397,10 @@ public actor GatewayClient {
         if case .array(let prompts)? = snapshot["prompts"] {
             found += prompts.compactMap { BotQuestion(prompt: $0, sessionID: sessionID) }
         }
+        // A connection card still open, with the gateway's own deadline.
+        if let pending = snapshot["pending_connection"], let connection = ConnectionRequest(payload: pending) {
+            found.append(BotQuestion(id: connection.opID, sessionID: sessionID, route: .connection, kind: .connection(connection)))
+        }
         return found
     }
 

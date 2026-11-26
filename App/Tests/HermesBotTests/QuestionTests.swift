@@ -437,6 +437,660 @@ struct QuestionTests {
         try await until("garden's card in the second app", within: 20) { !second.chat(for: garden).questions.cards.isEmpty }
     }
 
+    /// The connection card shown in a chat, as it now stands.
+    private func card(_ chat: ChatModel) -> (asked: ChatQuestions.Asked, card: ConnectionRequest)? {
+        guard let asked = chat.questions.cards.first, case .connection(let card) = asked.question.kind else { return nil }
+        return (asked, card)
+    }
+
+    private func row(_ name: String, _ chat: ChatModel) -> ConnectionTarget? {
+        card(chat)?.card.targets.first { $0.name == name }
+    }
+
+    @Test func aConnectionCardFollowsTheGatewaysStatesAndLeavesALine() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        send("ask me connect", chat, bot, roster)
+        try await until("the card") { card(chat) != nil }
+        let asked = try #require(card(chat)?.asked)
+        #expect(card(chat)?.card.targets.map(\.name) == ["notion", "filesystem"])
+        #expect(roster.rowPreview(for: bot) == "Waiting to connect")
+        // The hosted app's link was minted before the card came: it is to be opened, and the
+        // card has not been told the person opened it.
+        #expect(row("notion", chat)?.state == .initiated)
+        #expect(row("notion", chat)?.move == .open(URL(string: "https://auth.example.com/oauth/authorize?client=pretend&attempt=1")!))
+        #expect(asked.opened.isEmpty)
+        // What the server would run, where, and with which variables.
+        #expect(row("filesystem", chat)?.launch?.cwd == "/pretend/work")
+        #expect(row("filesystem", chat)?.launch?.env == ["ALLOWED_ROOT", "FS_INDEX_KEY"])
+
+        #expect(chat.questions.respond(asked.instance, with: ConnectionAnswer(moves: ["notion": .skip]), for: bot))
+        try await until("the row to be skipped") { row("notion", chat)?.state == .skipped }
+        try await until("the first move to land") { card(chat)?.asked.isMoving == false }
+
+        // Without the secret: the row stays pending and says what it waits for.
+        #expect(chat.questions.respond(asked.instance, with: ConnectionAnswer(moves: ["filesystem": .approve(values: ["ALLOWED_ROOT": "/pretend/docs"])]), for: bot))
+        try await until("the row to ask again") { row("filesystem", chat)?.detail == "waiting for FS_INDEX_KEY" }
+        #expect(row("filesystem", chat)?.state == .pending)
+        #expect(row("filesystem", chat)?.fields.map(\.name) == ["FS_INDEX_KEY"])
+        try await until("the move to land") { card(chat)?.asked.isMoving == false }
+
+        let secret = "pretend-secret-123"
+        // As the card sends it: the plain value sent before, with the secret now typed.
+        #expect(chat.questions.respond(asked.instance, with: ConnectionAnswer(moves: ["filesystem": .approve(values: [
+            "ALLOWED_ROOT": "/pretend/docs", "FS_INDEX_KEY": secret,
+        ])]), for: bot))
+        // Installing: nothing to press while the gateway works.
+        try await until("the install to begin") { row("filesystem", chat)?.state == .initiated }
+        #expect(row("filesystem", chat)?.move == ConnectionTarget.Move.none)
+        try await until("the card to settle") { chat.questions.cards.isEmpty }
+        try await until("the turn to end", within: 20) { !chat.isWorking }
+
+        guard case .settled(let ending)? = chat.questions.all.first?.state else { Issue.record("not settled"); return }
+        #expect(ending.text == "Skipped Notion · Installed Filesystem")
+        #expect(chat.questions.all.first?.isProvisional == false)
+        let heard = try await answers(pretend)
+        let installed = try #require(heard.last { ($0["moves"] as? [String: Any])?["filesystem"] != nil })
+        #expect(installed["secret_matches"] as? Bool == true)
+        // Nothing here holds the value typed.
+        #expect(!String(reflecting: chat.questions.all).contains(secret))
+    }
+
+    @Test func anExpiredSignInIsTriedAgainAndItsNewLinkWaitsForAClick() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        send("ask me connect expire", chat, bot, roster)
+        try await until("the card") { card(chat) != nil }
+        let asked = try #require(card(chat)?.asked)
+        chat.questions.opened(asked.instance, row: "notion")
+        try await until("the link to run out") { row("notion", chat)?.state == .expired }
+        // Still waiting on the person: skippable, and tried again rather than reopened.
+        #expect(row("notion", chat)?.isResolved == false)
+        #expect(row("notion", chat)?.move == .retry)
+        #expect(card(chat)?.asked.opened.isEmpty == true)
+        #expect(chat.questions.retry(asked.instance, row: "notion", for: bot))
+        try await until("a fresh link") { row("notion", chat)?.state == .initiated }
+        #expect(row("notion", chat)?.move == .open(URL(string: "https://auth.example.com/oauth/authorize?client=pretend&attempt=2")!))
+        #expect(card(chat)?.asked.opened.isEmpty == true)
+        let heard = try await answers(pretend)
+        #expect(heard.contains { $0["method"] as? String == "connectors.connect" && $0["reconnect"] as? Bool == true })
+        chat.questions.respond(asked.instance, with: ConnectionAnswer(isContinue: true), for: bot)
+        try await until("the card to settle") { chat.questions.cards.isEmpty }
+    }
+
+    @Test func aFailedSignInOffersNoDeadLink() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        send("ask me connect fail", chat, bot, roster)
+        try await until("the sign-in to fail") { row("notion", chat)?.state == .failed }
+        // Hermes leaves the old link on the row; it is never offered.
+        #expect(row("notion", chat)?.connectURL != nil)
+        #expect(row("notion", chat)?.move == .retry)
+        #expect(row("notion", chat)?.detail == "The vendor refused the sign-in.")
+        let asked = try #require(card(chat)?.asked)
+        chat.questions.respond(asked.instance, with: ConnectionAnswer(moves: ["notion": .skip, "filesystem": .skip]), for: bot)
+        try await until("the card to settle") { chat.questions.cards.isEmpty }
+    }
+
+    @Test func aFailedInstallAsksForItsValuesAgain() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        send("ask me connect installfail", chat, bot, roster)
+        try await until("the card") { card(chat) != nil }
+        let asked = try #require(card(chat)?.asked)
+        chat.questions.respond(asked.instance, with: ConnectionAnswer(moves: ["notion": .skip, "filesystem": .approve(values: [
+            "ALLOWED_ROOT": "/pretend/docs", "FS_INDEX_KEY": "pretend-secret-123",
+        ])]), for: bot)
+        try await until("the install to fail") { row("filesystem", chat)?.state == .failed }
+        #expect(row("filesystem", chat)?.isResolved == false)
+        #expect(row("filesystem", chat)?.move == .retry)
+        #expect(row("filesystem", chat)?.fields.map(\.name) == ["ALLOWED_ROOT", "FS_INDEX_KEY"])
+        try await until("the move to land") { card(chat)?.asked.isMoving == false }
+        chat.questions.respond(asked.instance, with: ConnectionAnswer(isContinue: true), for: bot)
+        try await until("the card to settle") { chat.questions.cards.isEmpty }
+        guard case .settled(let ending)? = chat.questions.all.first?.state else { Issue.record("not settled"); return }
+        // Continue leaves a failed server not connected, as Hermes stamps it.
+        #expect(ending.text == "Skipped Notion · Left Filesystem")
+    }
+
+    @Test func aCatalogCardShowsWhereItComesFromAndAFailedRowIsDone() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        send("ask me connect catalogfail", chat, bot, roster)
+        try await until("the card") { card(chat) != nil }
+        let asked = try #require(card(chat)?.asked)
+        let plugin = try #require(row("pretend-charts", chat))
+        #expect(plugin.source?.sha == "0123456789abcdef0123456789abcdef01234567")
+        #expect(plugin.source?.targetProfile == "default")
+        #expect(plugin.tier == .verified)
+        #expect(plugin.canBeApproved)
+        chat.questions.respond(asked.instance, with: ConnectionAnswer(moves: ["pretend-charts": .approve(values: [:])]), for: bot)
+        try await until("the plugin to fail") { row("pretend-charts", chat)?.state == .failed }
+        // Done for Hermes: it carries its reason, and the card waits only on the skill.
+        #expect(row("pretend-charts", chat)?.isResolved == true)
+        #expect(card(chat) != nil)
+        try await until("the move to land") { card(chat)?.asked.isMoving == false }
+        chat.questions.respond(asked.instance, with: ConnectionAnswer(moves: ["@pretend/notes-skill": .approve(values: [:])]), for: bot)
+        try await until("the card to settle") { chat.questions.cards.isEmpty }
+        guard case .settled(let ending)? = chat.questions.all.first?.state else { Issue.record("not settled"); return }
+        #expect(ending.text == "Pretend Charts didn't work · Installed Notes")
+    }
+
+    @Test func theDirectoryCardSaysWhatItWasWhenItSettles() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        send("ask me connect directory", chat, bot, roster)
+        try await until("the card") { card(chat) != nil }
+        let asked = try #require(card(chat)?.asked)
+        #expect(card(chat)?.card.suggested == ["notion", "linear"])
+        chat.questions.respond(asked.instance, with: ConnectionAnswer(isContinue: true), for: bot)
+        try await until("the card to settle") { chat.questions.cards.isEmpty }
+        // The settling update carries no `display`: the card is still known as the directory.
+        guard case .settled(let ending)? = chat.questions.all.first?.state else { Issue.record("not settled"); return }
+        #expect(ending.text == "Saw the apps to connect")
+    }
+
+    @Test func aServerThatCannotSayWhatItRunsIsNotOffered() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        send("ask me connect launchless short", chat, bot, roster)
+        try await until("the card") { card(chat) != nil }
+        #expect(row("filesystem", chat)?.launch == nil)
+        #expect(row("filesystem", chat)?.canBeApproved == false)
+        try await until("the card to time out", within: 20) { chat.questions.cards.isEmpty }
+        guard case .settled(let ending)? = chat.questions.all.first?.state else { Issue.record("not settled"); return }
+        #expect(ending.mark == .timedOut)
+    }
+
+    private func connectionQuestion(_ id: String, session: String, seq: Int = 1, settled: Bool = false, state: ConnectionTarget.State = .pending) -> (BotQuestion, ConnectionRequest) {
+        let request = ConnectionRequest(opID: id, seq: seq, deadline: nil, targets: [
+            ConnectionTarget(name: "notion", kind: .connector, action: .connect, state: state),
+        ], settledBy: settled ? "all_resolved" : nil, isSettled: settled)
+        return (BotQuestion(id: id, sessionID: session, route: .connection, kind: .connection(request)), request)
+    }
+
+    @Test func aCardWhoseTurnEndedIsOverAndTheGatewaysWordStillTakesItsPlace() throws {
+        let questions = ChatQuestions()
+        let client = GatewayClient(endpoint: try #require(GatewayEndpoint("127.0.0.1:1")), token: "t")
+        let (question, _) = connectionQuestion("op-t", session: "live-1")
+        questions.ask(question, on: client)
+        #expect(questions.isWaiting)
+        // The turn the card held has ended: its settling update was missed.
+        questions.turnEnded(inSession: "live-1", on: client)
+        #expect(!questions.isWaiting)
+        #expect(questions.all.first?.isProvisional == true)
+        // The gateway's own word comes after all, and says how.
+        let (_, final) = connectionQuestion("op-t", session: "live-1", seq: 3, settled: true, state: .skipped)
+        questions.connectionChanged(final, inSession: "live-1", on: client)
+        guard case .settled(let ending)? = questions.all.first?.state else { Issue.record("not settled"); return }
+        #expect(ending.text == "Skipped Notion")
+        #expect(questions.all.first?.isProvisional == false)
+        // An older word changes nothing now.
+        let (_, older) = connectionQuestion("op-t", session: "live-1", seq: 2, settled: true, state: .connected)
+        questions.connectionChanged(older, inSession: "live-1", on: client)
+        if case .settled(let still)? = questions.all.first?.state { #expect(still.text == "Skipped Notion") }
+    }
+
+    @Test func aMoveOnACardTheGatewayClosedSaysAnsweredElsewhere() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        let client = try await roster.liveClient()
+        // A card the gateway no longer has open.
+        let (question, _) = connectionQuestion("op-gone", session: "live-x")
+        chat.questions.ask(question, on: client)
+        let asked = try #require(chat.questions.cards.first)
+        #expect(chat.questions.respond(asked.instance, with: ConnectionAnswer(moves: ["notion": .skip]), for: bot))
+        try await until("the card to close") { chat.questions.cards.isEmpty }
+        guard case .settled(let ending)? = chat.questions.all.first?.state else { Issue.record("not settled"); return }
+        #expect(ending.text == "Answered elsewhere")
+        #expect(!chat.questions.isWaiting)
+    }
+
+    @Test func aCardChangedOrSettledWhileItsChatOpensIsShownAsItNowStands() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        let client = try await roster.liveClient()
+        // Asked in a chat not yet claimed, then settled before the chat is opened.
+        let (gone, _) = connectionQuestion("op-a", session: "live-new")
+        roster.asked(gone, on: client)
+        let (_, settled) = connectionQuestion("op-a", session: "live-new", seq: 2, settled: true, state: .skipped)
+        roster.connectionChanged(settled, inSession: "live-new", on: client)
+        // And another changed meanwhile.
+        let (moved, _) = connectionQuestion("op-b", session: "live-new")
+        roster.asked(moved, on: client)
+        let (_, skipped) = connectionQuestion("op-b", session: "live-new", seq: 2, state: .skipped)
+        roster.connectionChanged(skipped, inSession: "live-new", on: client)
+        // The opening's snapshot, taken earlier, still has both as first asked.
+        roster.chatOpened(LiveChat(sessionID: "live-new", waiting: [gone, moved]), of: bot, on: client)
+        #expect(chat.questions.all.map(\.question.id) == ["op-b"])
+        #expect(row("notion", chat)?.state == .skipped)
+    }
+
+    private func installCard(_ id: String, seq: Int, state: ConnectionTarget.State = .pending, fields: [String], link: String? = nil) -> ConnectionRequest {
+        ConnectionRequest(opID: id, seq: seq, deadline: nil, targets: [
+            ConnectionTarget(name: "fs", kind: .mcp, action: .install, state: state, connectURL: link.flatMap(URL.init(string:)),
+                             fields: fields.map { ConnectionTarget.Field(name: $0, isRequired: true, isSecret: true) },
+                             launch: ConnectionTarget.Launch(isRemote: false, target: "npx fs")),
+        ])
+    }
+
+    @Test func aCardAsksForEveryValueARowHasAskedFor() throws {
+        let questions = ChatQuestions()
+        let client = GatewayClient(endpoint: try #require(GatewayEndpoint("127.0.0.1:1")), token: "t")
+        let first = installCard("op-f", seq: 1, fields: ["A", "B"])
+        questions.ask(BotQuestion(id: "op-f", sessionID: "live-1", route: .connection, kind: .connection(first)), on: client)
+        // Hermes asks again only for what is missing, and kept neither: both are asked for together.
+        questions.connectionChanged(installCard("op-f", seq: 2, fields: ["B"]), inSession: "live-1", on: client)
+        #expect(shownFields(questions)["fs"]?.map(\.name) == ["A", "B"])
+        questions.connectionChanged(installCard("op-f", seq: 3, fields: ["A"]), inSession: "live-1", on: client)
+        #expect(shownFields(questions)["fs"]?.map(\.name) == ["A", "B"])
+    }
+
+    @Test func aLinkMadeAfreshIsNotOneThePersonOpened() throws {
+        let questions = ChatQuestions()
+        let client = GatewayClient(endpoint: try #require(GatewayEndpoint("127.0.0.1:1")), token: "t")
+        let card = installCard("op-o", seq: 1, state: .initiated, fields: [], link: "https://auth.example.com/1")
+        questions.ask(BotQuestion(id: "op-o", sessionID: "live-1", route: .connection, kind: .connection(card)), on: client)
+        let asked = try #require(questions.cards.first)
+        questions.opened(asked.instance, row: "fs")
+        // The same link again: still opened.
+        questions.connectionChanged(installCard("op-o", seq: 2, state: .initiated, fields: [], link: "https://auth.example.com/1"), inSession: "live-1", on: client)
+        #expect(questions.cards.first?.opened == ["fs"])
+        // Made afresh elsewhere, still initiated: not one opened here.
+        questions.connectionChanged(installCard("op-o", seq: 3, state: .initiated, fields: [], link: "https://auth.example.com/2"), inSession: "live-1", on: client)
+        #expect(questions.cards.first?.opened.isEmpty == true)
+    }
+
+    @Test func theLineACardLeavesSaysWhatWasAmissAndAStop() {
+        let caveat = ConnectionRequest(opID: "op-c", seq: 3, deadline: nil, targets: [
+            ConnectionTarget(name: "pretend_mcp", kind: .mcp, action: .authorize, state: .connected, caveat: "its tools couldn't be listed"),
+        ], settledBy: "all_resolved", isSettled: true)
+        let line = ChatQuestions.ending(for: caveat)
+        #expect(line.text == "Authorized Pretend MCP, but its tools couldn't be listed")
+        #expect(line.mark == .none)
+        let stopped = ConnectionRequest(opID: "op-d", seq: 2, deadline: nil, targets: [], suggested: ["notion"], settledBy: "interrupt", isSettled: true)
+        #expect(ChatQuestions.ending(for: stopped).text == "Stopped")
+    }
+
+    @Test func aTurnThatEndsWhileItsChatOpensLeavesNoCardFromTheSnapshot() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        let client = try await roster.liveClient()
+        let (old, _) = connectionQuestion("op-old", session: "live-late")
+        roster.asked(old, on: client)
+        // The turn that card held ends before the chat is claimed; its settling update was missed.
+        roster.turnEnded(inSession: "live-late", on: client)
+        // A card asked after it is its own.
+        let (fresh, _) = connectionQuestion("op-fresh", session: "live-late")
+        roster.asked(fresh, on: client)
+        roster.chatOpened(LiveChat(sessionID: "live-late", waiting: [old]), of: bot, on: client)
+        #expect(chat.questions.all.map(\.question.id) == ["op-fresh"])
+        // And one the gateway said was over is not put up again by a late request.
+        let (_, settled) = connectionQuestion("op-fresh", session: "live-late", seq: 2, settled: true)
+        roster.connectionChanged(settled, inSession: "live-late", on: client)
+        let (again, _) = connectionQuestion("op-again", session: "live-late")
+        roster.connectionChanged(ConnectionRequest(opID: "op-again", seq: 5, deadline: nil, targets: [], isSettled: true), inSession: "live-late", on: client)
+        roster.asked(again, on: client)
+        #expect(!chat.questions.all.contains { $0.question.id == "op-again" })
+    }
+
+    @Test func whatARowAskedForIsKeptWhateverOrderSnapshotsComeInAndOverAReconnect() throws {
+        let questions = ChatQuestions()
+        let first = GatewayClient(endpoint: try #require(GatewayEndpoint("127.0.0.1:1")), token: "t")
+        let second = GatewayClient(endpoint: try #require(GatewayEndpoint("127.0.0.1:1")), token: "t")
+        // The opening's snapshot (seq 2, narrowed) is put up before the request it follows (seq 1).
+        questions.ask(BotQuestion(id: "op-r", sessionID: "live-1", route: .connection, kind: .connection(installCard("op-r", seq: 2, fields: ["B"]))), on: first)
+        questions.ask(BotQuestion(id: "op-r", sessionID: "live-1", route: .connection, kind: .connection(installCard("op-r", seq: 1, fields: ["A", "B"]))), on: first)
+        #expect(Set(shownFields(questions)["fs"]?.map(\.name) ?? []) == ["A", "B"])
+        // Lost with its connection and handed back narrowed on the next: still both.
+        questions.lost(on: first)
+        questions.ask(BotQuestion(id: "op-r", sessionID: "live-1", route: .connection, kind: .connection(installCard("op-r", seq: 3, fields: ["B"]))), on: second)
+        #expect(Set(shownFields(questions)["fs"]?.map(\.name) ?? []) == ["A", "B"])
+    }
+
+    @Test func aSnapshotCardNotKnownToBeTheEndedTurnsIsCheckedWithTheGateway() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        let client = try await roster.liveClient()
+        roster.turnEnded(inSession: "live-main", on: client)
+        // A card the app never heard of, in a snapshot taken before the end: the gateway has no
+        // such card open, so it does not stay.
+        let (unknown, _) = connectionQuestion("op-unknown", session: "live-main")
+        roster.chatOpened(LiveChat(sessionID: "live-main", waiting: [unknown]), of: bot, on: client)
+        try await until("the card to be found over") { chat.questions.cards.isEmpty }
+        guard case .settled(let ending)? = chat.questions.all.first?.state else { Issue.record("not settled"); return }
+        #expect(ending.text == "Answered elsewhere")
+    }
+
+    @Test func fieldsHeardBeforeAChatIsClaimedAreAskedForWhenItIs() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        let client = try await roster.liveClient()
+        // Two updates heard for a chat not yet claimed, the newer asking for less.
+        roster.connectionChanged(installCard("op-u", seq: 1, fields: ["A", "B"]), inSession: "live-u", on: client)
+        roster.connectionChanged(installCard("op-u", seq: 2, fields: ["B"]), inSession: "live-u", on: client)
+        let snapshot = BotQuestion(id: "op-u", sessionID: "live-u", route: .connection, kind: .connection(installCard("op-u", seq: 2, fields: ["B"])))
+        roster.chatOpened(LiveChat(sessionID: "live-u", waiting: [snapshot]), of: bot, on: client)
+        #expect(Set(shownFields(chat.questions)["fs"]?.map(\.name) ?? []) == ["A", "B"])
+    }
+
+    @Test func aNewCardKeepsWhatItAskedForHoweverManyCameBefore() throws {
+        let questions = ChatQuestions()
+        let client = GatewayClient(endpoint: try #require(GatewayEndpoint("127.0.0.1:1")), token: "t")
+        for n in 1...25 {
+            let id = "op-\(n)"
+            questions.ask(BotQuestion(id: id, sessionID: "live-1", route: .connection, kind: .connection(installCard(id, seq: 1, fields: ["A", "B"]))), on: client)
+            questions.connectionChanged(installCard(id, seq: 2, fields: ["B"]), inSession: "live-1", on: client)
+            #expect(Set(questions.fields(of: questions.all.last?.question.id ?? "")["fs"]?.map(\.name) ?? []) == ["A", "B"], "card \(n)")
+            questions.connectionChanged(ConnectionRequest(opID: id, seq: 3, deadline: nil, targets: [], isSettled: true), inSession: "live-1", on: client)
+        }
+    }
+
+    @Test func fieldsHeardBeforeAChatIsClaimedOutlastAReconnect() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        let client = try await roster.liveClient()
+        roster.connectionChanged(installCard("op-d", seq: 1, fields: ["A", "B"]), inSession: "live-d", on: client)
+        roster.connectionChanged(installCard("op-d", seq: 2, fields: ["B"]), inSession: "live-d", on: client)
+        // The connection drops before the chat is claimed, and a new one is made.
+        var drop = URLRequest(url: URL(string: "http://\(pretend.address)/api/drop")!)
+        drop.setValue("demo", forHTTPHeaderField: "X-Hermes-Session-Token")
+        _ = try await URLSession.shared.data(for: drop)
+        var next = client
+        let deadline = Date.now.addingTimeInterval(15)
+        while next === client {
+            try #require(Date.now < deadline, "No new connection")
+            try await Task.sleep(for: .milliseconds(100))
+            next = (try? await roster.liveClient()) ?? client
+        }
+        // Opened again under a new live id, as Hermes gives after a reconnect.
+        let snapshot = BotQuestion(id: "op-d", sessionID: "live-d2", route: .connection, kind: .connection(installCard("op-d", seq: 2, fields: ["B"])))
+        roster.chatOpened(LiveChat(sessionID: "live-d2", waiting: [snapshot]), of: bot, on: next)
+        #expect(Set(shownFields(chat.questions)["fs"]?.map(\.name) ?? []) == ["A", "B"])
+    }
+
+    @Test func aCardWaitingForItsChatKeepsItsFieldsHoweverManyCardsWereDone() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        let client = try await roster.liveClient()
+        // Fifty cards asked and settled in other chats.
+        for n in 1...50 {
+            roster.connectionChanged(installCard("op-old\(n)", seq: 1, fields: ["A"]), inSession: "live-old\(n)", on: client)
+            roster.connectionChanged(ConnectionRequest(opID: "op-old\(n)", seq: 2, deadline: nil, targets: [], isSettled: true), inSession: "live-old\(n)", on: client)
+        }
+        // A new card asked in a chat not yet claimed, then more after it.
+        roster.asked(BotQuestion(id: "op-new", sessionID: "live-new", route: .connection, kind: .connection(installCard("op-new", seq: 1, fields: ["A", "B"]))), on: client)
+        for n in 1...3 { roster.connectionChanged(installCard("op-more\(n)", seq: 1, fields: ["A"]), inSession: "live-more\(n)", on: client) }
+        roster.connectionChanged(installCard("op-new", seq: 2, fields: ["B"]), inSession: "live-new", on: client)
+        let snapshot = BotQuestion(id: "op-new", sessionID: "live-new", route: .connection, kind: .connection(installCard("op-new", seq: 2, fields: ["B"])))
+        roster.chatOpened(LiveChat(sessionID: "live-new", waiting: [snapshot]), of: bot, on: client)
+        #expect(Set(shownFields(chat.questions)["fs"]?.map(\.name) ?? []) == ["A", "B"])
+    }
+
+    @Test func aWaitingCardKeepsItsFieldsOverAReconnectHoweverManyCardsCameAfter() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        let client = try await roster.liveClient()
+        roster.asked(BotQuestion(id: "op-x", sessionID: "live-x", route: .connection, kind: .connection(installCard("op-x", seq: 1, fields: ["A", "B"]))), on: client)
+        roster.connectionChanged(installCard("op-x", seq: 2, fields: ["B"]), inSession: "live-x", on: client)
+        // The connection drops before the chat is claimed, and a new one is made.
+        var drop = URLRequest(url: URL(string: "http://\(pretend.address)/api/drop")!)
+        drop.setValue("demo", forHTTPHeaderField: "X-Hermes-Session-Token")
+        _ = try await URLSession.shared.data(for: drop)
+        var next = client
+        let deadline = Date.now.addingTimeInterval(15)
+        while next === client {
+            try #require(Date.now < deadline, "No new connection")
+            try await Task.sleep(for: .milliseconds(100))
+            next = (try? await roster.liveClient()) ?? client
+        }
+        // Then fifty cards asked and settled elsewhere.
+        for n in 1...50 {
+            roster.connectionChanged(installCard("op-old\(n)", seq: 1, fields: ["A"]), inSession: "live-old\(n)", on: next)
+            roster.connectionChanged(ConnectionRequest(opID: "op-old\(n)", seq: 2, deadline: nil, targets: [], isSettled: true), inSession: "live-old\(n)", on: next)
+        }
+        let snapshot = BotQuestion(id: "op-x", sessionID: "live-x2", route: .connection, kind: .connection(installCard("op-x", seq: 2, fields: ["B"])))
+        roster.chatOpened(LiveChat(sessionID: "live-x2", waiting: [snapshot]), of: bot, on: next)
+        #expect(Set(shownFields(chat.questions)["fs"]?.map(\.name) ?? []) == ["A", "B"])
+    }
+
+    @Test func plainValuesTypedIntoAWaitingCardOutlastItsViewAndGoWhenItIsOver() throws {
+        let questions = ChatQuestions()
+        let client = GatewayClient(endpoint: try #require(GatewayEndpoint("127.0.0.1:1")), token: "t")
+        let card = ConnectionRequest(opID: "op-t", seq: 1, deadline: nil, targets: [
+            ConnectionTarget(name: "fs", kind: .mcp, action: .install, state: .pending, fields: [
+                ConnectionTarget.Field(name: "ROOT", isRequired: true, isSecret: false, defaultValue: "/d"),
+            ], launch: ConnectionTarget.Launch(isRemote: false, target: "npx fs")),
+        ])
+        let question = BotQuestion(id: "op-t", sessionID: "live-1", route: .connection, kind: .connection(card))
+        questions.ask(question, on: client)
+        // Typed while the card shows; the card's view goes (another bot is picked) and comes back.
+        questions.setDraft("/home/me/notes", of: "op-t", row: "fs", field: "ROOT")
+        #expect(questions.draft(of: "op-t", row: "fs", field: "ROOT") == "/home/me/notes")
+        // Lost with the connection and put up again: still there.
+        questions.lost(on: client)
+        let next = GatewayClient(endpoint: try #require(GatewayEndpoint("127.0.0.1:1")), token: "t")
+        questions.ask(question, on: next)
+        #expect(questions.draft(of: "op-t", row: "fs", field: "ROOT") == "/home/me/notes")
+        // Over: let go.
+        questions.connectionChanged(ConnectionRequest(opID: "op-t", seq: 2, deadline: nil, targets: [], settledBy: "continue", isSettled: true), inSession: "live-1", on: next)
+        #expect(questions.draft(of: "op-t", row: "fs", field: "ROOT") == nil)
+        // A card that is not waiting takes no draft.
+        questions.setDraft("x", of: "op-t", row: "fs", field: "ROOT")
+        #expect(questions.draft(of: "op-t", row: "fs", field: "ROOT") == nil)
+    }
+
+    /// Drops every connection to the pretend gateway and waits for the roster's next one.
+    private func dropAndReconnect(_ pretend: Pretend, _ roster: RosterModel, from client: GatewayClient) async throws -> GatewayClient {
+        var drop = URLRequest(url: URL(string: "http://\(pretend.address)/api/drop")!)
+        drop.setValue("demo", forHTTPHeaderField: "X-Hermes-Session-Token")
+        _ = try await URLSession.shared.data(for: drop)
+        var next = client
+        let deadline = Date.now.addingTimeInterval(15)
+        while next === client {
+            try #require(Date.now < deadline, "No new connection")
+            try await Task.sleep(for: .milliseconds(100))
+            next = (try? await roster.liveClient()) ?? client
+        }
+        return next
+    }
+
+    private func plainCard(_ id: String, seq: Int = 1) -> ConnectionRequest {
+        ConnectionRequest(opID: id, seq: seq, deadline: nil, targets: [
+            ConnectionTarget(name: "fs", kind: .mcp, action: .install, state: .pending, fields: [
+                ConnectionTarget.Field(name: "ROOT", isRequired: true, isSecret: false),
+                ConnectionTarget.Field(name: "KEY", isRequired: true, isSecret: true),
+            ], launch: ConnectionTarget.Launch(isRemote: false, target: "npx fs")),
+        ])
+    }
+
+    /// The fields kept for the card shown first in a chat.
+    private func shownFields(_ questions: ChatQuestions) -> [String: [ConnectionTarget.Field]] {
+        questions.fields(of: questions.cards.first?.question.id ?? "")
+    }
+
+    @Test func aCardThatSettlesWhileDisconnectedLeavesNothingKept() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        let client = try await roster.liveClient()
+        let card = BotQuestion(id: "op-s", sessionID: "live-s", route: .connection, kind: .connection(plainCard("op-s")))
+        roster.chatOpened(LiveChat(sessionID: "live-s", waiting: [card]), of: bot, on: client)
+        chat.questions.setDraft("/home/me", of: "op-s", row: "fs", field: "ROOT")
+        let next = try await dropAndReconnect(pretend, roster, from: client)
+        // The chat is opened again under a new live id, and the card's updates come on it.
+        let again = BotQuestion(id: "op-s", sessionID: "live-s2", route: .connection, kind: .connection(plainCard("op-s", seq: 2)))
+        roster.chatOpened(LiveChat(sessionID: "live-s2", waiting: [again]), of: bot, on: next)
+        #expect(chat.questions.draft(of: "op-s", row: "fs", field: "ROOT") == "/home/me")
+        // Settled on the gateway, heard on the new connection and live id: nothing is kept for it.
+        roster.connectionChanged(ConnectionRequest(opID: "op-s", seq: 3, deadline: nil, targets: [], isSettled: true), inSession: "live-s2", on: next)
+        #expect(chat.questions.draft(of: "op-s", row: "fs", field: "ROOT") == nil)
+        #expect(!roster.connectionMemory.entries.keys.contains { $0.op == "op-s" })
+    }
+
+    @Test func aDeletedBotsWaitingCardsGoWithItAndNoOneElses() async throws {
+        let pretend = try await Pretend()
+        let (roster, main, mainChat) = try await open(pretend)
+        let garden = try #require(roster.bots.first { $0.name == "garden" })
+        let gardenChat = roster.chat(for: garden)
+        await gardenChat.load(garden, from: roster)
+        var now: TimeInterval = 0
+        roster.connectionMemory.clock = { now }
+        let client = try await roster.liveClient()
+        // A card waiting in each chat, with a plain field typed into.
+        roster.chatOpened(LiveChat(sessionID: "live-g", waiting: [BotQuestion(id: "op-g", sessionID: "live-g", route: .connection, kind: .connection(plainCard("op-g")))]), of: garden, on: client)
+        roster.chatOpened(LiveChat(sessionID: "live-m", waiting: [BotQuestion(id: "op-m", sessionID: "live-m", route: .connection, kind: .connection(plainCard("op-m")))]), of: main, on: client)
+        gardenChat.questions.setDraft("/home/garden", of: "op-g", row: "fs", field: "ROOT")
+        mainChat.questions.setDraft("/home/main", of: "op-m", row: "fs", field: "ROOT")
+        #expect(await roster.delete(garden) == nil)
+        now += ConnectionMemory.retention + 60
+        roster.connectionMemory.prune()
+        #expect(!roster.connectionMemory.entries.keys.contains { $0.owner == "garden" })
+        // The main bot's card is still shown as waiting, so it is kept whatever the clock says.
+        #expect(mainChat.questions.draft(of: "op-m", row: "fs", field: "ROOT") == "/home/main")
+    }
+
+    @Test func aStaleEmptyOpeningLosesNothingOfAWaitingCard() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        let client = try await roster.liveClient()
+        let card = BotQuestion(id: "op-e", sessionID: "live-e", route: .connection, kind: .connection(installCard("op-e", seq: 1, fields: ["A", "B"])))
+        roster.chatOpened(LiveChat(sessionID: "live-e", waiting: [card]), of: bot, on: client)
+        chat.questions.setDraft("typed", of: "op-e", row: "fs", field: "A")
+        // An older opening that held no card comes in after the chat was claimed.
+        roster.chatOpened(LiveChat(sessionID: "live-e", waiting: []), of: bot, on: client)
+        #expect(chat.questions.draft(of: "op-e", row: "fs", field: "A") == "typed")
+        // The next update asks only for what is missing; every field is still asked for.
+        roster.connectionChanged(installCard("op-e", seq: 2, fields: ["B"]), inSession: "live-e", on: client)
+        #expect(Set(chat.questions.fields(of: "op-e")["fs"]?.map(\.name) ?? []) == ["A", "B"])
+    }
+
+    @Test func aTurnEndingAfterAReconnectLosesNothingUntilTheCardSettles() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        let client = try await roster.liveClient()
+        let card = BotQuestion(id: "op-t", sessionID: "live-t", route: .connection, kind: .connection(installCard("op-t", seq: 1, fields: ["A", "B"])))
+        roster.chatOpened(LiveChat(sessionID: "live-t", waiting: [card]), of: bot, on: client)
+        chat.questions.setDraft("typed", of: "op-t", row: "fs", field: "A")
+        let next = try await dropAndReconnect(pretend, roster, from: client)
+        // The turn ends before the chat is opened again: the card stops being shown, its memory stays.
+        roster.turnEnded(inSession: "live-t", on: next)
+        #expect(chat.questions.draft(of: "op-t", row: "fs", field: "A") == "typed")
+        // Opened again under a new live id, then settled there.
+        let again = BotQuestion(id: "op-t", sessionID: "live-t2", route: .connection, kind: .connection(installCard("op-t", seq: 2, fields: ["B"])))
+        roster.chatOpened(LiveChat(sessionID: "live-t2", waiting: [again]), of: bot, on: next)
+        #expect(Set(chat.questions.fields(of: "op-t")["fs"]?.map(\.name) ?? []) == ["A", "B"])
+        roster.connectionChanged(ConnectionRequest(opID: "op-t", seq: 3, deadline: nil, targets: [], isSettled: true), inSession: "live-t2", on: next)
+        #expect(chat.questions.draft(of: "op-t", row: "fs", field: "A") == nil)
+    }
+
+    @Test func manyWaitingCardsKeepEveryField() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        let client = try await roster.liveClient()
+        for n in 1...60 {
+            roster.asked(BotQuestion(id: "op-\(n)", sessionID: "live-\(n)", route: .connection, kind: .connection(installCard("op-\(n)", seq: 1, fields: ["A", "B"]))), on: client)
+            roster.connectionChanged(installCard("op-\(n)", seq: 2, fields: ["B"]), inSession: "live-\(n)", on: client)
+        }
+        let next = try await dropAndReconnect(pretend, roster, from: client)
+        let snapshot = BotQuestion(id: "op-1", sessionID: "live-1b", route: .connection, kind: .connection(installCard("op-1", seq: 2, fields: ["B"])))
+        roster.chatOpened(LiveChat(sessionID: "live-1b", waiting: [snapshot]), of: bot, on: next)
+        #expect(Set(chat.questions.fields(of: "op-1")["fs"]?.map(\.name) ?? []) == ["A", "B"])
+        for n in 1...60 {
+            let kept = roster.connectionMemory.entries.first { $0.key.op == "op-\(n)" }?.value.fields["fs"]
+            #expect(Set(kept?.map(\.name) ?? []) == ["A", "B"], "op-\(n)")
+        }
+    }
+
+    @Test func aCardInOneBotsChatNeverReadsAnothersWithTheSameId() throws {
+        let memory = ConnectionMemory()
+        let client = GatewayClient(endpoint: try #require(GatewayEndpoint("127.0.0.1:1")), token: "t")
+        let garden = ChatQuestions(), trips = ChatQuestions()
+        garden.memory = memory; garden.owner = "garden"
+        trips.memory = memory; trips.owner = "trips"
+        garden.ask(BotQuestion(id: "op-x", sessionID: "live-1", route: .connection, kind: .connection(installCard("op-x", seq: 1, fields: ["A", "B"]))), on: client)
+        trips.ask(BotQuestion(id: "op-x", sessionID: "live-2", route: .connection, kind: .connection(installCard("op-x", seq: 1, fields: ["C"]))), on: client)
+        garden.setDraft("garden's", of: "op-x", row: "fs", field: "A")
+        #expect(trips.draft(of: "op-x", row: "fs", field: "A") == nil)
+        #expect(trips.fields(of: "op-x")["fs"]?.map(\.name) == ["C"])
+        // Settled in one bot's chat: the other's stays.
+        trips.connectionChanged(ConnectionRequest(opID: "op-x", seq: 2, deadline: nil, targets: [], isSettled: true), inSession: "live-2", on: client)
+        #expect(garden.draft(of: "op-x", row: "fs", field: "A") == "garden's")
+    }
+
+    @Test func aCardThatHasEndedIsNotBroughtBackByAnOlderFrame() {
+        let memory = ConnectionMemory()
+        let key = ConnectionMemory.Key(owner: "garden", op: "op-f")
+        memory.heard(installCard("op-f", seq: 1, fields: ["A"]), as: key, inSession: "live-1")
+        // Ended for good (answered settled, closed elsewhere, or a settled update).
+        memory.finish(key)
+        memory.heard(installCard("op-f", seq: 1, fields: ["A"]), as: key, inSession: "live-1")
+        #expect(memory.entries[key] == nil)
+        memory.setDraft("x", of: key, row: "fs", field: "A")
+        #expect(memory.entries[key] == nil)
+    }
+
+    @Test func aCardShownAsWaitingIsKeptWhateverTheGatewaysClockSays() {
+        let memory = ConnectionMemory()
+        var now: TimeInterval = 1_000
+        memory.clock = { now }
+        let key = ConnectionMemory.Key(owner: "garden", op: "op-c")
+        // A deadline already past by this Mac's clock (the gateway's runs behind).
+        let card = ConnectionRequest(opID: "op-c", seq: 1, deadline: Date.now.addingTimeInterval(-120), targets: installCard("op-c", seq: 1, fields: ["A"]).targets)
+        memory.heard(card, as: key, inSession: "live-1")
+        memory.setShown(["op-c"], owner: "garden")
+        now += 3 * 3600
+        memory.setDraft("typed", of: key, row: "fs", field: "A")
+        #expect(memory.draft(of: key, row: "fs", field: "A") == "typed")
+        // No longer shown: it lasts thirty minutes of this Mac's clock, then goes.
+        memory.setShown([], owner: "garden")
+        now += 29 * 60
+        #expect(memory.draft(of: key, row: "fs", field: "A") == "typed")
+        now += 2 * 60
+        #expect(memory.draft(of: key, row: "fs", field: "A") == nil)
+        memory.prune()
+        #expect(memory.entries.isEmpty)
+    }
+
+    @Test func overTheLimitTheCardsNeverShownNorTypedIntoGoFirst() {
+        let memory = ConnectionMemory()
+        var now: TimeInterval = 0
+        memory.clock = { now }
+        let typed = ConnectionMemory.Key(owner: "garden", op: "op-typed")
+        let shown = ConnectionMemory.Key(owner: "garden", op: "op-shown")
+        // The oldest two are the one typed into and the one on screen.
+        memory.heard(installCard("op-typed", seq: 1, fields: ["A"]), as: typed, inSession: nil)
+        memory.setDraft("x", of: typed, row: "fs", field: "A")
+        memory.heard(installCard("op-shown", seq: 1, fields: ["A"]), as: shown, inSession: nil)
+        memory.setShown(["op-shown"], owner: "garden")
+        for n in 1...(ConnectionMemory.most + 5) {
+            now += 1
+            memory.heard(installCard("op-\(n)", seq: 1, fields: ["A"]), as: .init(owner: "garden", op: "op-\(n)"), inSession: nil)
+        }
+        #expect(memory.entries.count == ConnectionMemory.most)
+        #expect(memory.entries[typed] != nil && memory.entries[shown] != nil)
+    }
+
+    @Test func aFailedAuthorizationIsTriedAgainWithAFreshLink() async throws {
+        let pretend = try await Pretend()
+        let (roster, bot, chat) = try await open(pretend)
+        send("ask me connect authorizefail", chat, bot, roster)
+        try await until("the authorization to fail") { row("calendar.work", chat)?.state == .failed }
+        let failed = try #require(row("calendar.work", chat))
+        // Hermes runs a failed MCP row again when it is approved (`_RETRY`); only a hosted app
+        // is minted afresh through `connectors.connect`, which refuses a name with a dot.
+        #expect(failed.move == .retry && !failed.retriesByReissue && failed.canBeApproved)
+        #expect(ConnectionTarget(name: "notion", kind: .connector, action: .authorize, state: .failed).retriesByReissue)
+        let asked = try #require(card(chat)?.asked)
+        #expect(chat.questions.respond(asked.instance, with: ConnectionAnswer(moves: ["calendar.work": .approve(values: [:])]), for: bot))
+        try await until("a fresh link") { row("calendar.work", chat)?.state == .initiated }
+        #expect(row("calendar.work", chat)?.connectURL?.absoluteString.hasSuffix("attempt=2") == true)
+        let heard = try await answers(pretend)
+        #expect(heard.contains { $0["method"] as? String == "connection.respond" && ($0["moves"] as? [String: String]) == ["calendar.work": "approved"] })
+        #expect(!heard.contains { $0["method"] as? String == "connectors.connect" })
+        chat.questions.respond(asked.instance, with: ConnectionAnswer(isContinue: true), for: bot)
+        try await until("the card to settle") { chat.questions.cards.isEmpty }
+    }
+
     /// A chat the gateway let go of and `/yolo` opened again is taken up as any opening is:
     /// the question waiting in it, which this app was never sent, is put up from its snapshot.
     @Test func aChatYoloOpensAgainIsTakenUpWithItsQuestions() async throws {
