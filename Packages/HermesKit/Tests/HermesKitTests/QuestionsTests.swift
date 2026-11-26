@@ -313,6 +313,117 @@ struct QuestionsTests {
         #expect(older.params(of: "prompt.submit").first?["clarify_batch"] == nil)
     }
 
+    @Test func theApprovalModeIsReadAndSetOnlyWhereSettingsArePerBot() async throws {
+        // Scoped gateway: first config.get probes the nonexistent bot, later ones return the mode.
+        let asked = Counter()
+        let (scoped, scopedEndpoint) = try await FakeGateway.start { id, method in
+            if method == "config.get", asked.next() == 1 {
+                return [#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":4064,"message":"Profile 'hermes-bot-no-such-bot' does not exist."}}"#]
+            }
+            return [#"{"jsonrpc":"2.0","id":\#(id),"result":{"key":"approvals.mode","value":"smart"}}"#]
+        }
+        defer { scoped.stop() }
+        let client = GatewayClient(endpoint: scopedEndpoint, token: "t")
+        await client.connect()
+        #expect(try await client.approvalMode(of: "garden") == .smart)
+        #expect(try await client.setApprovalMode(.smart, of: "garden") == .smart)
+        let gets = scoped.params(of: "config.get")
+        #expect(gets.count == 2)
+        #expect(gets.first?["profile"] as? String == "hermes-bot-no-such-bot")
+        #expect(gets.last?["key"] as? String == "approvals.mode")
+        #expect(gets.last?["profile"] as? String == "garden")
+        let set = try #require(scoped.params(of: "config.set").first)
+        #expect(set["key"] as? String == "approvals.mode")
+        #expect(set["value"] as? String == "smart")
+        #expect(set["profile"] as? String == "garden")
+
+        // Unscoped gateway (Hermes before 0.21.6): answers for the nonexistent bot, so neither
+        // reading nor writing approvals.mode is allowed.
+        let (unscoped, unscopedEndpoint) = try await FakeGateway.start { id, _ in
+            [#"{"jsonrpc":"2.0","id":\#(id),"result":{"key":"reasoning","value":"medium"}}"#]
+        }
+        defer { unscoped.stop() }
+        let old = GatewayClient(endpoint: unscopedEndpoint, token: "t")
+        await old.connect()
+        await #expect(throws: GatewayError.unsupported(method: "config.get")) { try await old.approvalMode(of: "garden") }
+        await #expect(throws: GatewayError.unsupported(method: "config.set")) { try await old.setApprovalMode(.off, of: "garden") }
+        #expect(unscoped.params(of: "config.set").isEmpty)
+        #expect(unscoped.params(of: "config.get").count == 1)
+
+        // Session authority: config.set requires a session_id, so approvals.mode is not offered.
+        let greeting = #"{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready","payload":{"session_authority":true}}}"#
+        let (authority, authorityEndpoint) = try await FakeGateway.start(greeting: greeting) { id, _ in
+            [#"{"jsonrpc":"2.0","id":\#(id),"result":{"key":"approvals.mode","value":"manual"}}"#]
+        }
+        defer { authority.stop() }
+        let authClient = GatewayClient(endpoint: authorityEndpoint, token: "t")
+        await authClient.connect()
+        await #expect(throws: GatewayError.unsupported(method: "config.get")) { try await authClient.approvalMode(of: "default") }
+        await #expect(throws: GatewayError.unsupported(method: "config.set")) { try await authClient.setApprovalMode(.smart, of: "default") }
+        #expect(authority.params(of: "config.get").isEmpty)
+        #expect(authority.params(of: "config.set").isEmpty)
+    }
+
+    @Test func unknownApprovalKeyAndOutOfSyncAreUnsupportedWhileWriteRefusalStaysRejected() async throws {
+        // 4002 unknown config key -> unsupported.
+        let probe1 = Counter()
+        let (noKey, noKeyEndpoint) = try await FakeGateway.start { id, method in
+            if method == "config.get", probe1.next() == 1 {
+                return [#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":4064,"message":"Profile 'hermes-bot-no-such-bot' does not exist."}}"#]
+            }
+            return [#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":4002,"message":"unknown config key: approvals.mode"}}"#]
+        }
+        defer { noKey.stop() }
+        let c1 = GatewayClient(endpoint: noKeyEndpoint, token: "t")
+        await c1.connect()
+        await #expect(throws: GatewayError.unsupported(method: "config.get")) { try await c1.approvalMode(of: "default") }
+        await #expect(throws: GatewayError.unsupported(method: "config.set")) { try await c1.setApprovalMode(.smart, of: "default") }
+
+        // 4002 ConfigWriteError (not unknown config key) -> rejected, not unsupported.
+        let probe2 = Counter()
+        let (locked, lockedEndpoint) = try await FakeGateway.start { id, method in
+            if method == "config.get", probe2.next() == 1 {
+                return [#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":4064,"message":"Profile 'hermes-bot-no-such-bot' does not exist."}}"#]
+            }
+            return [#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":4002,"message":"approvals.mode is locked by policy"}}"#]
+        }
+        defer { locked.stop() }
+        let c2 = GatewayClient(endpoint: lockedEndpoint, token: "t")
+        await c2.connect()
+        await #expect(throws: GatewayError.rejected(code: 4002, message: "approvals.mode is locked by policy")) {
+            try await c2.setApprovalMode(.smart, of: "default")
+        }
+
+        // 4000 invalid params -> outOfSync -> unsupported.
+        let probe3 = Counter()
+        let (outOfSync, outOfSyncEndpoint) = try await FakeGateway.start { id, method in
+            if method == "config.get", probe3.next() == 1 {
+                return [#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":4064,"message":"Profile 'hermes-bot-no-such-bot' does not exist."}}"#]
+            }
+            return [#"{"jsonrpc":"2.0","id":\#(id),"error":{"code":4000,"message":"invalid params for config.get: profile"}}"#]
+        }
+        defer { outOfSync.stop() }
+        let c3 = GatewayClient(endpoint: outOfSyncEndpoint, token: "t")
+        await c3.connect()
+        await #expect(throws: GatewayError.unsupported(method: "config.get")) { try await c3.approvalMode(of: "default") }
+    }
+
+    @Test func allBotsFailsRatherThanSkippingAnUnreadableProfile() async throws {
+        let (gateway, endpoint) = try await FakeGateway.start { id, _ in
+            [#"{"jsonrpc":"2.0","id":\#(id),"result":{"profiles":[{"name":"default","is_default":true},{"not_a_name":1}]}}"#]
+        }
+        defer { gateway.stop() }
+        let client = GatewayClient(endpoint: endpoint, token: "t")
+        await client.connect()
+        await #expect(throws: GatewayError.unexpectedReply(method: "profiles.list")) { try await client.allBots() }
+    }
+
+    private final class Counter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func next() -> Int { lock.withLock { count += 1; return count } }
+    }
+
     @Test func windowRequestsAreDeclinedWhereTheGatewayCountsDeclines() throws {
         for method in ["preview.read", "preview.act", "terminal.read", "window.read", "tour", "theme.apply"] {
             #expect(IncomingRequest.read(method: method, id: .string("s"), params: try json(#"{"session_id":"x"}"#), declinesNotShown: true)
@@ -640,6 +751,24 @@ struct QuestionsTests {
         await #expect(throws: GatewayClient.ConnectionOver.self) {
             _ = try await c4.retry("notion", of: card, inSession: "live-1", profile: "default")
         }
+    }
+
+    /// Every `profiles.list` answer a client hears is noted by the names it gave, and a mark
+    /// whose answers are no longer all kept says so rather than passing some over.
+    @Test func everyBotListHeardIsNotedUntilTooManyHaveCome() async throws {
+        let client = GatewayClient(endpoint: try #require(GatewayEndpoint("127.0.0.1:1")), token: "t")
+        let mark = await client.listingMark()
+        await client.noteListing([try json(#"{"name": "default"}"#), try json(#"{"title": "no name"}"#)])
+        await client.noteListing([try json(#"{"name": "default"}"#)])
+        let listed = try #require(await client.listings(since: mark))
+        let heard = listed.heard
+        #expect(listed.through == mark + 2)
+        #expect(heard.count == 2)
+        #expect(heard[0].contains("default") && heard[0].count == 2)
+        #expect(heard[1] == ["default"])
+        for _ in 0..<GatewayClient.listingsKept { await client.noteListing([]) }
+        #expect(await client.listings(since: mark) == nil)
+        #expect(await client.listings(since: await client.listingMark())?.heard == [])
     }
 }
 

@@ -10,6 +10,12 @@ struct PageOutOfSight: Error {}
 /// turn: it would have gone under the approvals being left.
 struct ApprovalsWereChanging: Error {}
 
+/// Writes of approval modes under way that every chat holds its messages for.
+@Observable
+final class ApprovalsHold {
+    var count = 0
+}
+
 /// One bot's chat: what is stored, and the message being answered right now.
 @MainActor
 @Observable
@@ -54,7 +60,7 @@ final class ChatModel {
     private(set) var latest: LatestTurn?
     /// Reactions on stored rows, by row.
     private(set) var reactions: [Int: [Reaction]] = [:]
-    /// The emoji offered for reacting, as the design has them.
+    /// The emoji offered for reacting, as the sketch the owner chose has them.
     static let quickReactions = ["👍", "❤️", "😂", "😮", "🙏", "👀"]
     /// This gateway keeps no reactions, so none are offered.
     private(set) var cannotReact = false
@@ -222,6 +228,11 @@ final class ChatModel {
     private(set) var shows = 0
     /// Changes to approvals asked for and not yet answered. No message goes meanwhile.
     var approvalsChanging = 0
+    /// The roster's hold while it writes approval modes from Settings or to a new bot, shared
+    /// by every chat, those made meanwhile too.
+    var approvalsHold: ApprovalsHold?
+    /// Whether messages are held for a change to approvals, this chat's own or the roster's.
+    var approvalsHeld: Bool { approvalsChanging > 0 || (approvalsHold?.count ?? 0) > 0 }
     /// Said of a message held back for one.
     static let heldForApprovals = "Not sent while approvals were changing. Send it again."
     /// The last change to approvals asked for: each waits for the one before, so they land
@@ -949,7 +960,7 @@ final class ChatModel {
     @discardableResult
     private func send(_ text: String, hidden: Bool, given: Bool = false, to bot: Bot, through roster: RosterModel, seen: (@MainActor () -> Bool)? = nil, receipt: ((Bool?) -> Void)? = nil, rewinding: LatestTurn? = nil) -> Bool {
         // Nothing goes while a change to approvals is on its way: it would run under the old ones.
-        guard !cannotSend, phase == .loaded, approvalsChanging == 0 else { return false }
+        guard !cannotSend, phase == .loaded, !approvalsHeld else { return false }
         // Words alone can join an answer under way; what is attached waits for a message
         // of its own, and stays in the box until then.
         if canAddToTurn, !text.isEmpty, let live, var answer = turn {
@@ -983,8 +994,8 @@ final class ChatModel {
                 // Stopped, or the answer no longer followed, before its turn to go came: it is not sent.
                 // Held back if approvals began changing while it waited its turn: it would go
                 // under the approvals being left.
-                if approvalsChanging > 0 { problem = Self.heldForApprovals }
-                if mayGo, approvalsChanging == 0, thisSend == sendCount, stage == .answering, isFollowing, !stopRequested, !isAbandoned {
+                if approvalsHeld { problem = Self.heldForApprovals }
+                if mayGo, !approvalsHeld, thisSend == sendCount, stage == .answering, isFollowing, !stopRequested, !isAbandoned {
                     do {
                         let begunBefore = turnsBegun
                         let receipt = try await live.client.send(text, in: live.chat, profile: bot.name, hidden: hidden)
@@ -1128,7 +1139,7 @@ final class ChatModel {
             guard !isAbandoned else { throw CancellationError() }
             // A change to approvals asked for while this waited goes first: sent now, it
             // would run under the approvals being left. Nothing is awaited from here to the send.
-            guard approvalsChanging == 0 else { throw ApprovalsWereChanging() }
+            guard !approvalsHeld else { throw ApprovalsWereChanging() }
             stage = .submitting
             let receipt = try await client.send(message, in: open, profile: bot.name, pictures: pictures, hidden: hidden, rewinding: rewinding?.rewind, fence: fence)
             accepted = true
@@ -2785,7 +2796,7 @@ private struct Composer: View {
         // Words can join an answer under way; what is attached needs a message of its own.
         guard chat.filesBeingRead == 0 else { return false }
         // Not while a command is opening the chat: a fresh message would wait on it.
-        guard chat.approvalsChanging == 0 else { return false }
+        guard !chat.approvalsHeld else { return false }
         return chat.isWorking ? chat.canAddToTurn && hasWords : chat.commandOpen == nil && (hasWords || !chat.attachments.isEmpty)
     }
 

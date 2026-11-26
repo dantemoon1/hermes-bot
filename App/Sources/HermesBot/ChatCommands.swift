@@ -382,7 +382,11 @@ extension ChatModel {
         // A change to approvals holds every message until the gateway has answered for it,
         // and goes after any change before it.
         if command.name == "approvals", !words.isEmpty {
-            changeApprovals { [weak self] in await self?.perform(command, line, words: words, note: note, for: bot, through: roster) }
+            roster.approvalsChangedInChat()
+            changeApprovals { [weak self] in
+                defer { roster.approvalsChangedInChat() }
+                await self?.perform(command, line, words: words, note: note, for: bot, through: roster)
+            }
         } else {
             Task { await perform(command, line, words: words, note: note, for: bot, through: roster) }
         }
@@ -415,7 +419,8 @@ extension ChatModel {
                     // Sent as the person's next message, or left in the box when that can't be now.
                     if !send(to: bot, through: roster, words: message) {
                         putAhead(message)
-                        finish(addNote(.line, asked: line), "\(bot.title) is busy. Send this when it has finished.")
+                        // Held for a change to approvals is said as that, not as the bot being busy.
+                        finish(addNote(.line, asked: line), approvalsHeld ? Self.heldForApprovals : "\(bot.title) is busy. Send this when it has finished.")
                     }
                 case .prefill(let message, let notice):
                     // Said once the chat shows it: the words come back as what they replace goes.

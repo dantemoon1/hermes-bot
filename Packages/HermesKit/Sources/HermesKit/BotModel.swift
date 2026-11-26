@@ -278,8 +278,8 @@ extension GatewayClient {
     /// A bot's name no gateway has, asked about to see whether a gateway keeps to the bot named.
     static let noSuchBot = "hermes-bot-no-such-bot"
 
-    private func requireSettingsPerBot() async throws {
-        guard try await keepsSettingsPerBot() else { throw GatewayError.unsupported(method: "config.set") }
+    func requireSettingsPerBot(_ method: String = "config.set") async throws {
+        guard try await keepsSettingsPerBot() else { throw GatewayError.unsupported(method: method) }
     }
 
     /// A gateway older than one of these calls' fields refuses them as being out of step

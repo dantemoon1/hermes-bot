@@ -15,7 +15,7 @@ Not affiliated with Nous Research.
 - Replies arrive word by word and are laid out properly: lists, tables, code.
 - Bots can draw in the chat. A bot writes a small HTML page (a chart, a widget) and it shows inside its reply, in the app's colours, with no network access at all. Click a button in one and the bot can update it.
 - Send files and pictures; bots hand files and pictures back.
-- When a bot needs you mid-task (may it run a command, a question, a password it needs), it asks in the chat and you answer there. If you're in another chat or the app is in the background, the bot's row says it's waiting and you get a notification.
+- When a bot needs you mid-task (may it run a command, a question, a password it needs), it asks in the chat and you answer there. If you're in another chat or the app is in the background, the bot's row says it's waiting and you get a notification. In Settings you choose how often your bots ask before a risky step: every time, only for risky things, or never.
 - When a bot wants to connect an app, add an MCP server or install a plugin or skill, a card in the chat shows exactly what will run or be signed in to, and you approve, sign in or skip each one.
 - Make, rename and delete bots; pick each one's model and how hard it thinks; edit its personality; see how full its context is.
 - Type `/` in the message box for commands: switch model or effort, retry, undo, ask something on the side, and more.

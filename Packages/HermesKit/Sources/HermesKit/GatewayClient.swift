@@ -56,6 +56,12 @@ public actor GatewayClient {
     private var isGreeted = false
     /// Whether the gateway keeps a bot's settings to that bot, once asked on this socket.
     var settingsPerBot: Bool?
+    /// The bots each `profiles.list` answer on this client named, newest last, by number,
+    /// whoever asked for it and whatever became of it (`noteListing`).
+    var listingsHeard: [(number: Int, names: Set<String>)] = []
+    var listingsCount = 0
+    /// Told the bots of each such answer as it is noted (`hearBotListings`).
+    var listingHeard: (@Sendable (Int, Set<String>) -> Void)?
     /// Counts sockets opened, so what was found out on one is not kept for the next.
     private(set) var sockets = 0
     private var awaitingGreeting: [CheckedContinuation<Void, Never>] = []
