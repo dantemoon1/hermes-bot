@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 
 NAME="Hermes Bot"
 BUNDLE_ID="${BUNDLE_ID:-com.dantemoon1.hermes-bot}"
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-0.1.1}"
 BUILD="${BUILD:-$(git rev-list --count HEAD 2>/dev/null || echo 1)}"
 IDENTITY="${SIGN_IDENTITY:--}"
 ARCHS="${ARCHS:-arm64 x86_64}"

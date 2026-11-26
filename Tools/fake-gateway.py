@@ -25,7 +25,7 @@ a bot is answering turns the answer to it, as the real gateway does by default, 
 the chat open sees every answer. Nothing here is real
 data; keep it that way, since screenshots of it get shared.
 """
-import base64, hashlib, json, socketserver, struct, sys, threading, time, uuid
+import base64, hashlib, json, re, socketserver, struct, sys, threading, time, uuid
 from urllib.parse import urlparse, parse_qs, unquote
 
 TOKEN = "demo"
@@ -251,7 +251,8 @@ def speak_unasked(name):
 # questions). A message with "ask me" in it asks for those it names: "approve" (a command), "folder", "site",
 # "clarify", "secret", "sudo", "stale" (leave asked for and then withdrawn), and "bridges"
 # (every request the app should refuse at once), "ghost" (a question for a chat no app has
-# opened). "short" makes the gateway wait 4 s, not 60.
+# opened), "connect" (a connection card, played through Hermes's own states, see
+# connection_card). "short" makes the gateway wait 4 s, not 60.
 # Requests go only to apps that said they answer them (client.capabilities), as on the real
 # older route; the session authority sends them to every app with the chat open.
 REQUESTS = {}       # id -> what was asked and, once answered, the answer
@@ -260,7 +261,38 @@ ANSWERS = []        # what apps answered, for tests to read from /api/status; ne
 LATE_READY = 0  # seconds the greeting waits after a connection opens
 GENERATION = 7  # the execution generation every chat here is in
 PRETEND_SECRET = "pretend-secret-123"  # what a test types: the answer is checked against it, never kept
-QUESTION_WORDS = ("approve", "folder", "site", "clarify", "secret", "sudo", "stale", "bridges", "ghost")
+QUESTION_WORDS = ("approve", "folder", "site", "clarify", "secret", "sudo", "stale", "bridges", "ghost", "connect")
+CONNECTIONS = {}  # op id -> a connection card: its chat, its rows, and what wakes the bot when it settles
+
+
+def connection_resolves(row):
+    """`contract.resolves`: connected or skipped, and a failed catalog row."""
+    return row["state"] in ("connected", "skipped") or (row["state"] == "failed" and row["kind"] in ("plugin", "skill"))
+
+
+def connection_all_resolved(op):
+    return bool(op["targets"]) and all(connection_resolves(r) for r in op["targets"])
+
+
+def connection_rows(op):
+    """Each row as `Target.snapshot` gives it: with `resolved`, and never the values approved."""
+    return [{**{k: v for k, v in row.items() if k != "declared_env"}, "resolved": connection_resolves(row)} for row in op["targets"]]
+
+
+def connection_view(op):
+    return {"op_id": op["op_id"], "seq": op["seq"], "deadline_at": op["deadline_at"], "settled": bool(op.get("settled")),
+            "settled_at": op.get("settled_at"), "settled_by": op.get("settled_by"), "targets": connection_rows(op)}
+
+
+def connection_request_payload(op, display=None):
+    """`request_payload`: also the resume snapshot's `pending_connection`."""
+    card = CONNECTIONS.get(op["op_id"]) or {}
+    display = display if display is not None else card.get("display")
+    payload = {"op_id": op["op_id"], "seq": op["seq"], "deadline_at": op["deadline_at"], "timeout_seconds": 300,
+               "targets": connection_rows(op)}
+    if display is not None:
+        payload["display"] = display
+    return payload
 
 
 def note_answer(method, result):
@@ -649,6 +681,28 @@ class Handler(socketserver.StreamRequestHandler):
                     threading.Thread(target=lambda frame=frame, rows=rows: (time.sleep(4), self.result(frame, {"sessions": rows})), daemon=True).start()
                 else:
                     self.result(frame, {"sessions": rows})
+            elif method in ("connection.respond", "connectors.connect", "connectors.operation.status"):
+                owner = params.get("owner") or {}
+                if method != "connectors.connect":
+                    card = CONNECTIONS.get(params.get("op_id"))
+                else:
+                    card = next((c for c in CONNECTIONS.values() if "live-" + c["chat"] == owner.get("session_id") and not c["op"].get("settled")), None)
+                if card is None or card["op"].get("settled") or owner.get("session_id") != "live-" + card["chat"]:
+                    # As the real gateway: a closed or unknown operation is unknown_operation.
+                    self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 4004, "message": "No open operation with that op_id."}})
+                    continue
+                if method == "connectors.operation.status":
+                    self.result(frame, connection_view(card["op"]))
+                    continue
+                if method == "connectors.connect":
+                    error = self.connection_retry(card, params.get("connectors") or [], params.get("reconnect"))
+                    if error:
+                        self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {"code": 4002, "message": error}})
+                    else:
+                        self.result(frame, connection_view(card["op"]))
+                    continue
+                settled = self.connection_respond(card, params.get("result") or {})
+                self.result(frame, {"status": "ok", "settled": settled})
             elif method == "clarify.lock":
                 # One answer of a set, locked before the rest; the set's own answer comes later.
                 entry = REQUESTS.get(params.get("request_id"))
@@ -826,6 +880,9 @@ class Handler(socketserver.StreamRequestHandler):
                          "open_requests": [{"id": e["id"], "method": e["method"], "params": e["params"]} for e in waiting if e["kind"] == "request"]}
                 if BUSY_MODE == "authority":
                     reply.update(prompts=[e["prompt"] for e in waiting if e["kind"] == "prompt"])
+                card = next((c for c in CONNECTIONS.values() if c["chat"] == chat_id and not c["op"].get("settled")), None)
+                if card is not None:
+                    reply["pending_connection"] = connection_request_payload(card["op"])
                 self.result(frame, reply)
             elif method == "image.attach_bytes" and chat_id in CHATS:
                 # A picture queued for the next message in this chat, as the real gateway does.
@@ -1281,6 +1338,8 @@ class Handler(socketserver.StreamRequestHandler):
             got = self.ask(chat_id, "sudo", {"command": "sudo systemctl restart pretend"}, wait, emit, stopped)
             value = (got or {}).get("value") if isinstance(got, dict) else None
             heard.append("password " + ("given" if value else "not given"))
+        if "connect" in text:
+            heard.append(self.connection_card(chat_id, text, emit, stopped))
         if "ghost" in text:
             # A question for a chat nobody opened, to every app that answers questions: it should
             # be refused, not left to its deadline.
@@ -1308,6 +1367,219 @@ class Handler(socketserver.StreamRequestHandler):
             AUTO[rid] = "display.install.sudo"
             self.send({"jsonrpc": "2.0", "id": rid, "method": "display.install.sudo", "params": {"session_id": "", "profile_key": "default"}})
         return heard
+
+    def connection_card(self, chat_id, text, emit, stopped):
+        """Plays a manage_connections card through Hermes's own states (tools/connectors:
+        contract.py, operation.py, mcp.py, managed.py, catalog.py, display.py). Which card comes
+        from the words in the message:
+
+        - (none): a hosted app and an MCP server to install. The hosted row arrives `initiated`
+          with its link, minted before the card is drawn, and no name of its own; the MCP row
+          `pending` with the values it needs, and goes `initiated` (no link) while it installs,
+          then `connected`. One missing a required value stays `pending`, saying what it waits for.
+        - "signin": the hosted app's sign-in finishes by itself 3 s in, as the watcher sees it.
+        - "expire": the hosted app's link runs out 2 s in (`expired`); Try again mints a fresh one.
+        - "fail": the hosted app fails 2 s in, keeping its dead link on the row, as Hermes does.
+        - "installfail": the MCP install fails, and asks for its values again.
+        - "authorize": an MCP server to authorize: its sign-in link is minted before the card
+          ("authorizefail": it fails 2 s in, and approving it again mints a fresh link, as
+          `_RETRY` does; its name, `calendar.work`, is one `connectors.connect` refuses).
+        - "catalog": a catalog plugin and a skill to install ("catalogfail": the plugin fails,
+          which counts as resolved for a catalog row).
+        - "directory": the directory card, with no rows; only Continue settles it.
+        - "launchless": the MCP row comes with no launch line.
+        - "short": the card's deadline is 6 s, not 300.
+        """
+        wait = 6 if "short" in text else 300
+        hosted = {"name": "notion", "kind": "connector", "action": "connect", "state": "initiated",
+                  "connect_url": "https://auth.example.com/oauth/authorize?client=pretend&attempt=1"}
+        filesystem = {"name": "filesystem", "kind": "mcp", "action": "install", "state": "pending",
+                      "instructions": "Read and search files inside one allowed folder.",
+                      "required_env": [{"name": "ALLOWED_ROOT", "required": True, "secret": False, "default": "/pretend/docs"},
+                                       {"name": "FS_INDEX_KEY", "required": True, "secret": True, "default": ""}]}
+        if "launchless" not in text:
+            filesystem["launch"] = {"kind": "stdio", "target": "npx -y @pretend/server-filesystem /pretend/docs",
+                                    "cwd": "/pretend/work", "env": ["ALLOWED_ROOT", "FS_INDEX_KEY"]}
+        if "directory" in text:
+            targets, display = [], {"suggested": ["notion", "linear"]}
+        elif "catalog" in text:
+            display = None
+            targets = [
+                {"name": "pretend-charts", "kind": "plugin", "action": "install", "state": "pending", "display": "Pretend Charts",
+                 "description": "Draws charts from tables.", "tier": "verified", "repo": "github.com/pretend/charts",
+                 "sha": "0123456789abcdef0123456789abcdef01234567", "subdir": "plugin", "target_profile": "default",
+                 "platforms": ["macos", "linux"], "requires_hermes": ">=0.20", "has_desktop_half": False, "app_state": "unknown",
+                 "required_env": [{"name": "CHARTS_TOKEN", "required": False, "secret": True, "default": ""}]},
+                {"name": "@pretend/notes-skill", "kind": "skill", "action": "install", "state": "pending", "display": "Notes",
+                 "description": "Keeps tidy notes.", "tier": "community", "target_profile": "default"},
+            ]
+        elif "authorize" in text:
+            display = None
+            targets = [{"name": "calendar.work", "kind": "mcp", "action": "authorize", "state": "initiated",
+                        "connect_url": "https://auth.example.com/mcp/authorize?server=calendar&attempt=1",
+                        "launch": {"kind": "remote", "target": "https://mcp.example.com/calendar"}}]
+        else:
+            display = None
+            targets = [hosted, filesystem]
+        op = {"op_id": "op-" + uuid.uuid4().hex[:10], "seq": 1 if targets and targets[0]["state"] == "initiated" else 0,
+              "deadline_at": time.time() + wait, "settled_at": None, "settled_by": None, "targets": targets}
+        card = {"chat": chat_id, "op": op, "event": threading.Event(), "emit": emit, "display": display, "text": text,
+                "lock": threading.Lock(), "approved_env": {}}
+        CONNECTIONS[op["op_id"]] = card
+        emit("connection.request", connection_request_payload(op, display))
+        def later(delay, step):
+            def run():
+                time.sleep(delay)
+                with card["lock"]:
+                    if not op.get("settled"):
+                        step()
+            threading.Thread(target=run, daemon=True).start()
+        if targets and targets[0]["kind"] == "mcp" and targets[0]["action"] == "authorize" and "authorizefail" in text:
+            row = targets[0]
+            later(2, lambda: row["state"] == "initiated" and self.connection_move(card, row, "failed", detail="The authorization was refused."))
+        if targets and targets[0]["kind"] == "connector":
+            row = targets[0]
+            if "signin" in text:
+                later(3, lambda: row["state"] == "initiated" and self.connection_move(card, row, "connected", tools=["search_pages", "get_page"]))
+            elif "expire" in text:
+                later(2, lambda: row["state"] == "initiated" and self.connection_move(card, row, "expired", detail="The sign-in link ran out."))
+            elif "fail" in text and "installfail" not in text:
+                later(2, lambda: row["state"] == "initiated" and self.connection_move(card, row, "failed", detail="The vendor refused the sign-in."))
+        while not card["event"].wait(0.1):
+            if stopped.is_set() or time.time() >= op["deadline_at"]:
+                with card["lock"]:
+                    self.connection_settle(card, "interrupt" if stopped.is_set() else "deadline")
+                break
+        return "connection " + ", ".join(f"{row['name']} {row['state']}" for row in op["targets"])
+
+    def connection_emit(self, card, change=None):
+        """One connection.update: the whole snapshot, as `_connection_update` sends it (no `display`)."""
+        payload = {**connection_view(card["op"]), "owner": {"type": "session", "session_id": "live-" + card["chat"]}}
+        if change:
+            payload.update(change)
+        card["emit"]("connection.update", payload)
+
+    def connection_move(self, card, row, to, detail=None, **extra):
+        """One transition of one row, as `ConnectionOperation.transition`; settles when all are resolved."""
+        change = {"target": row["name"], "from": row["state"], "to": to}
+        row["state"] = to
+        if detail is not None:
+            row["detail"] = detail
+        row.update(extra)
+        card["op"]["seq"] += 1
+        self.connection_emit(card, change)
+        if connection_all_resolved(card["op"]):
+            self.connection_settle(card, "all_resolved")
+
+    def connection_settle(self, card, by):
+        op = card["op"]
+        if op.get("settled"):
+            return
+        for row in op["targets"]:
+            if not connection_resolves(row):
+                row["state"] = "not_connected"
+        op["settled"], op["settled_at"], op["settled_by"] = True, time.time(), by
+        op["seq"] += 1
+        self.connection_emit(card)
+        card["event"].set()
+
+    def connection_start(self, card, row, env):
+        """Approve (or Try again) on an MCP or catalog row, as `_start_install` / `approve`."""
+        if row["kind"] == "mcp" and row["action"] == "authorize":
+            if row["state"] in ("failed", "expired"):
+                # `_RETRY` runs `_start_oauth` again: a fresh attempt with a fresh sign-in link.
+                attempt = int(row["connect_url"].rsplit("=", 1)[-1]) + 1 if "attempt=" in (row.get("connect_url") or "") else 2
+                row["detail"] = ""
+                self.connection_move(card, row, "initiated", connect_url=f"https://auth.example.com/mcp/authorize?server=calendar&attempt={attempt}")
+            return  # a pending one has nothing to approve: its link is the step (`_nothing`)
+        approved = {**card["approved_env"].get(row["name"], {}), **env}
+        declared = row.get("declared_env") or row.get("required_env") or []
+        missing = [f for f in declared if f.get("required", True) and not approved.get(f["name"])]
+        if missing and row["kind"] == "mcp":
+            # Stays pending, asking again for what is missing (`operation.refresh`).
+            row["required_env"], row["declared_env"] = missing, declared
+            row["detail"] = "waiting for " + ", ".join(f["name"] for f in missing)
+            card["op"]["seq"] += 1
+            self.connection_emit(card)
+            return
+        card["approved_env"][row["name"]] = approved
+        row["declared_env"] = declared
+        row["required_env"] = []
+        row.pop("detail", None)
+        self.connection_move(card, row, "initiated", detail="", **({"phase": "downloading"} if row["kind"] in ("plugin", "skill") else {}))
+        fails = ("installfail" in card["text"] and row["kind"] == "mcp") or ("catalogfail" in card["text"] and row["kind"] == "plugin")
+        def finish():
+            if row["state"] != "initiated":
+                return
+            row.pop("phase", None)
+            if fails:
+                # A failed install asks for its fields again (`_fail_install`); a catalog row keeps its reason.
+                if row["kind"] == "mcp":
+                    row["required_env"] = declared
+                self.connection_move(card, row, "failed", detail="The install did not finish: npm could not reach the registry.")
+            else:
+                self.connection_move(card, row, "connected", tools=["read_file", "list_dir", "search_files"] if row["kind"] == "mcp" else [])
+        def run():
+            time.sleep(0.8)
+            with card["lock"]:
+                if not card["op"].get("settled"):
+                    finish()
+        threading.Thread(target=run, daemon=True).start()
+
+    def connection_respond(self, card, answer):
+        """`connection.respond`: skips, approvals and Continue, as `mcp.apply_answer` folds them."""
+        heard = {"method": "connection.respond", "moves": {}, "values": []}
+        with card["lock"]:
+            op = card["op"]
+            for move in answer.get("targets") or []:
+                row = next((r for r in op["targets"] if r["name"] == move.get("name")), None)
+                if row is None or op.get("settled"):
+                    continue
+                status = move.get("status")
+                heard["moves"][row["name"]] = status
+                if status == "skipped":
+                    if row["state"] not in ("connected", "skipped"):
+                        self.connection_move(card, row, "skipped")
+                elif status == "approved" and row["kind"] != "connector" and row["state"] in ("pending", "failed", "expired"):
+                    env = move.get("env") or {}
+                    # Kept only as which names came and whether the secret one was the pretend one.
+                    heard["values"] = sorted(env)
+                    heard["secret_matches"] = env.get("FS_INDEX_KEY") == PRETEND_SECRET
+                    heard["secret_sent"] = "FS_INDEX_KEY" in env
+                    if env.get("ref"):
+                        heard["ref"] = env["ref"]
+                    self.connection_start(card, row, env)
+            if op.get("settled"):
+                pass
+            elif answer.get("settled_by") == "continue" or answer.get("said"):
+                self.connection_settle(card, "continue")
+            elif connection_all_resolved(op):
+                self.connection_settle(card, "all_resolved")
+            ANSWERS.append(heard)
+            return bool(op.get("settled"))
+
+    def connection_retry(self, card, names, reconnect):
+        """`connectors.connect` with `reconnect`: Try again on failed or expired rows (`run.reissue`)."""
+        ANSWERS.append({"method": "connectors.connect", "connectors": names, "reconnect": bool(reconnect)})
+        if not reconnect:
+            return "Connector parameters are invalid."
+        if any(not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", str(name)) for name in names):
+            # The contract's `ConnectorSlug`: an MCP server's name with a dot is refused.
+            return "string_pattern_mismatch: connectors"
+        with card["lock"]:
+            rows = [next((r for r in card["op"]["targets"] if r["name"] == name), None) for name in names]
+            if any(r is None for r in rows):
+                return "No such target on the open operation."
+            if any(r["state"] not in ("failed", "expired") for r in rows):
+                return "Reopen the stored link."
+            for row in rows:
+                if row["kind"] == "connector":
+                    attempt = int(row["connect_url"].rsplit("=", 1)[-1]) + 1 if row.get("connect_url") else 2
+                    row["detail"] = ""
+                    self.connection_move(card, row, "initiated", connect_url=f"https://auth.example.com/oauth/authorize?client=pretend&attempt={attempt}")
+                else:
+                    self.connection_start(card, row, {})
+        return None
 
     def slash(self, frame, chat_id, command):
         """A slash command, as Hermes's slash.exec answers one: words it printed, or a message

@@ -15,6 +15,9 @@ public struct BotQuestion: Sendable, Equatable, Identifiable {
         case request(JSONValue)
         /// A prompt of the session authority's, answered by method, for the turn it belongs to.
         case prompt(generation: Int)
+        /// A connection card, answered move by move with `connection.respond`; its id is the
+        /// operation's.
+        case connection
     }
 
     public enum Kind: Sendable, Equatable {
@@ -26,6 +29,8 @@ public struct BotQuestion: Sendable, Equatable, Identifiable {
         /// The person's password, for a command the bot runs with `sudo`. The command is as the
         /// gateway gives it, with anything that looks like a credential taken out.
         case sudo(command: String)
+        /// App accounts to connect and MCP servers to install (`ConnectionRequest`).
+        case connection(ConnectionRequest)
     }
 
     /// The gateway's id for the request or prompt.
@@ -359,6 +364,11 @@ extension BotQuestion {
             self = question
             return
         }
+        if event.type == "connection.request" {
+            guard let connection = ConnectionRequest(payload: event.payload), let sessionID = event.sessionID, !sessionID.isEmpty else { return nil }
+            self.init(id: connection.opID, sessionID: sessionID, route: .connection, kind: .connection(connection))
+            return
+        }
         guard event.type == "approval.request" || event.type == "clarify.request" else { return nil }
         self.init(prompt: event.payload, sessionID: event.sessionID ?? "")
     }
@@ -409,6 +419,8 @@ extension GatewayClient {
         case .request(let id):
             try await respond(to: id, with: Self.result(for: question, answer))
             return true
+        case .connection:
+            return false
         case .prompt(let generation):
             var params: [String: JSONValue] = [
                 "session_id": .string(question.sessionID),
@@ -484,6 +496,9 @@ extension GatewayClient {
             return .object(["value": .string(value)])
         case (.secret, _), (.sudo, _):
             return .object(["value": .string("")])
+        case (.connection, _):
+            // Answered move by move (`respond(to:inSession:with:profile:)`), never so.
+            return .object([:])
         }
     }
 }

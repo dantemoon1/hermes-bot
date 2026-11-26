@@ -455,7 +455,22 @@ final class RosterModel {
     /// is selected.
     private var chats: [Bot.ID: ChatModel] = [:]
 
-    func chat(for bot: Bot) -> ChatModel { chats[bot.id] ?? ChatModel() }
+    func chat(for bot: Bot) -> ChatModel { chats[bot.id] ?? newChat(for: bot) }
+
+    /// A chat for a bot, sharing the gateway's memory of connection cards.
+    private func newChat(for bot: Bot) -> ChatModel {
+        let chat = ChatModel()
+        chat.questions.memory = connectionMemory
+        chat.questions.owner = bot.name
+        return chat
+    }
+
+    /// Whose a connection card heard of in a chat is: the bot whose chat it is, once claimed,
+    /// or the chat itself until then.
+    private func memoryKey(_ opID: String, inSession session: String?) -> ConnectionMemory.Key {
+        if let session, let owner = liveSessions[session] { return .init(owner: owner.bot, op: opID) }
+        return .chat(session ?? "", op: opID)
+    }
 
     private func take(_ bots: [Bot]) {
         self.bots = bots
@@ -463,7 +478,7 @@ final class RosterModel {
         previews = Dictionary(bots.compactMap { bot in
             bot.chat.map { (bot.id, ReplyFormat.preview(of: $0.preview)) }
         }, uniquingKeysWith: { first, _ in first })
-        for bot in bots where chats[bot.id] == nil { chats[bot.id] = ChatModel() }
+        for bot in bots where chats[bot.id] == nil { chats[bot.id] = newChat(for: bot) }
         refreshUnread()
         catchUpShowing()
     }
@@ -519,6 +534,19 @@ final class RosterModel {
     /// ends while its chat is being opened must not be put up from the opening's snapshot.
     private var endedLately: [EndedQuestion] = []
 
+    /// The newest word the gateway has sent on each open connection card, by operation, on the
+    /// connection in use: a card still waiting for its chat to be claimed, or coming back in an
+    /// opening's snapshot, is shown as that word says, not as it was first asked.
+    private var connectionUpdates: [String: (update: ConnectionRequest, session: String?, client: GatewayClient, order: Int)] = [:]
+    private var connectionUpdatesHeard = 0
+    /// What is kept for each connection card on this gateway while it may still be answered
+    /// (`ConnectionMemory`): one for the gateway, handed to every chat, cleared when it is left.
+    let connectionMemory = ConnectionMemory()
+    /// Chats not yet claimed here whose turn ended lately, and when. A connection card holds
+    /// its turn until it settles, so one in an opening's snapshot taken before that end may be
+    /// over, and is checked with the gateway; a card asked after it comes as its own request.
+    private var turnsEndedUnclaimed: [String: Date] = [:]
+
     /// A question the gateway said was over, by its id and, where the gateway named it, its chat.
     private struct EndedQuestion: Equatable {
         let id: String
@@ -540,20 +568,94 @@ final class RosterModel {
         // has been let go of, and must not keep the look for waiting chats from this one.
         liveSessions = liveSessions.filter { $0.key == open.sessionID || $0.value.bot != bot.id || $0.value.client !== client }
         liveSessions[open.sessionID] = (bot.id, client)
+        // What was kept for cards heard in this chat before it was claimed is its bot's now.
+        connectionMemory.adopt(session: open.sessionID,
+                               ops: Set(open.waiting.map(\.id) + (unclaimed[open.sessionID] ?? []).map(\.question.id)), bot: bot.name)
+        let turnEnded = turnsEndedUnclaimed.removeValue(forKey: open.sessionID).map { Date.now.timeIntervalSince($0) < 30 } ?? false
         for question in open.waiting where !endedLately.contains(where: { $0.names(question) }) {
-            chat.questions.ask(question, on: client, notBefore: chat.newestShown)
+            put(question, in: chat, on: client)
+            // A turn ended while this chat was opening, and this card was not known to be its:
+            // the gateway says whether it is still open, and one that is not is over here too.
+            if turnEnded, case .connection = question.kind {
+                let opID = question.id
+                Task { [weak self] in
+                    guard let open = try? await client.connectionIsOpen(opID, inSession: question.sessionID, profile: bot.name), !open,
+                          let self, client === self.client else { return }
+                    self.chats[bot.id]?.questions.connectionGone(opID, on: client)
+                }
+            }
         }
         for waiting in unclaimed.removeValue(forKey: open.sessionID) ?? []
         where waiting.client === client && !endedLately.contains(where: { $0.names(waiting.question) }) {
-            chat.questions.ask(waiting.question, on: client, notBefore: chat.newestShown)
+            put(waiting.question, in: chat, on: client)
         }
     }
 
-    /// A question from the gateway, for whichever bot's chat it was put in.
-    private func asked(_ question: BotQuestion, on client: GatewayClient) {
+    /// A turn has ended in a chat. Questions open in it that only the turn kept open are over;
+    /// for a chat not yet claimed here, connection cards waiting for it are dropped, and one in
+    /// its opening's snapshot is not put up (`turnsEndedUnclaimed`).
+    func turnEnded(inSession session: String, on client: GatewayClient) {
         guard client === self.client else { return }
+        for chat in chats.values { chat.questions.turnEnded(inSession: session, on: client) }
+        guard liveSessions[session] == nil else { return }
+        turnsEndedUnclaimed[session] = .now
+        if turnsEndedUnclaimed.count > 50, let oldest = turnsEndedUnclaimed.min(by: { $0.value < $1.value })?.key { turnsEndedUnclaimed[oldest] = nil }
+        // The cards known for this chat were the ended turn's: over, by their own ids.
+        var over = Set(connectionUpdates.filter { $0.value.client === client && $0.value.session == session }.map(\.key))
+        if let waiting = unclaimed[session] {
+            for entry in waiting { if case .connection = entry.question.kind { over.insert(entry.question.id) } }
+            let left = waiting.filter { if case .connection = $0.question.kind { false } else { true } }
+            unclaimed[session] = left.isEmpty ? nil : left
+        }
+        endedLately = Array((endedLately + over.map { EndedQuestion(id: $0, session: session) }).suffix(200))
+    }
+
+    /// Puts a question up in a chat; a connection card as the newest word heard on it says.
+    private func put(_ question: BotQuestion, in chat: ChatModel, on client: GatewayClient) {
+        chat.questions.ask(question, on: client, notBefore: chat.newestShown)
+        if case .connection = question.kind, let heard = connectionUpdates[question.id], heard.client === client {
+            chat.questions.connectionChanged(heard.update, inSession: heard.session ?? question.sessionID, on: client)
+        }
+    }
+
+    /// The gateway says what has changed on a connection card. Kept, newest first, for a card
+    /// whose chat is still being opened; one that is over is noted as ended, so an opening's
+    /// snapshot taken before it ended does not put it up again.
+    func connectionChanged(_ update: ConnectionRequest, inSession sessionID: String?, on client: GatewayClient) {
+        guard client === self.client else { return }
+        // Kept for the card until it settles or its deadline passes, whatever is shown.
+        connectionMemory.heard(update, as: memoryKey(update.opID, inSession: sessionID), inSession: sessionID)
+        if let kept = connectionUpdates[update.opID], kept.client === client, kept.update.updated(by: update) == nil {
+            // Not newer than one already heard: moves nothing.
+        } else {
+            connectionUpdatesHeard += 1
+            connectionUpdates[update.opID] = (update, sessionID, client, connectionUpdatesHeard)
+            // Kept for cards still open first; of the rest, the one heard of longest ago goes.
+            if connectionUpdates.count > 50, let oldest = connectionUpdates.min(by: {
+                ($0.value.update.isSettled ? 0 : 1, $0.value.order) < ($1.value.update.isSettled ? 0 : 1, $1.value.order)
+            })?.key {
+                connectionUpdates[oldest] = nil
+            }
+        }
+        if update.isSettled {
+            let ended = EndedQuestion(id: update.opID, session: sessionID)
+            endedLately = Array((endedLately + [ended]).suffix(200))
+            for (session, waiting) in unclaimed {
+                let left = waiting.filter { !(ended.names($0.question) && $0.client === client) }
+                unclaimed[session] = left.isEmpty ? nil : left
+            }
+        }
+        for chat in chats.values { chat.questions.connectionChanged(update, inSession: sessionID, on: client) }
+    }
+
+    /// A question from the gateway, for whichever bot's chat it was put in.
+    func asked(_ question: BotQuestion, on client: GatewayClient) {
+        guard client === self.client, !endedLately.contains(where: { $0.names(question) }) else { return }
+        if case .connection(let card) = question.kind {
+            connectionMemory.heard(card, as: memoryKey(card.opID, inSession: question.sessionID), inSession: question.sessionID)
+        }
         if let owner = liveSessions[question.sessionID], owner.client === client, let chat = chats[owner.bot] {
-            chat.questions.ask(question, on: client, notBefore: chat.newestShown)
+            put(question, in: chat, on: client)
             return
         }
         // Its chat is still being opened. Kept a little while, then refused: a question no
@@ -596,7 +698,13 @@ final class RosterModel {
             let left = waiting.filter { $0.client !== client }
             return left.isEmpty ? nil : left
         }
-        if client === self.client { endedLately = [] }
+        if client === self.client {
+            endedLately = []
+            turnsEndedUnclaimed = [:]
+        }
+        connectionUpdates = connectionUpdates.filter { $0.value.client !== client }
+        // What cards asked for is kept over a reconnect to the same gateway (Hermes keeps no
+        // value from a partial approval); leaving the gateway clears it.
     }
 
     /// The load a look for chats that may be waiting on the person is under way in. One left
@@ -691,6 +799,7 @@ final class RosterModel {
             case .clarify: return "Waiting for your answer"
             case .secret: return "Waiting for a secret"
             case .sudo: return "Waiting for a password"
+            case .connection: return "Waiting to connect"
             }
         }
         return previews[bot.id] ?? ""
@@ -1146,10 +1255,16 @@ final class RosterModel {
                     self.refreshSoon()
                 } else if let question = BotQuestion(event) {
                     self.asked(question, on: client)
+                } else if event.type == "connection.update", let update = ConnectionRequest(payload: event.payload) {
+                    // An account's card (Hermes's Connectors page) is no chat's.
+                    let owner = event.payload["owner"]
+                    if owner?["type"]?.stringValue != "account" {
+                        self.connectionChanged(update, inSession: event.sessionID ?? owner?["session_id"]?.stringValue, on: client)
+                    }
                 } else if let ended = BotQuestion.ended(by: event) {
                     self.questionEnded(ended.id, inSession: event.sessionID, on: client, reason: ended.reason)
                 } else if event.type == "message.complete", let session = event.sessionID, client === self.client {
-                    for chat in self.chats.values { chat.questions.turnEnded(inSession: session, on: client) }
+                    self.turnEnded(inSession: session, on: client)
                 }
             }
             // Only when the connection really went: a watch replaced by another ends here too.
@@ -2177,6 +2292,8 @@ final class RosterModel {
         filesEpoch += 1
         chats[bot.id]?.abandon()
         chats[bot.id] = nil
+        // What was kept for its connection cards, which being shown as waiting kept from expiring.
+        connectionMemory.forget(owner: bot.id)
         saving[bot.id] = nil
         settingsSaving[bot.id] = nil
         // A bot made again under the same name is another bot.
@@ -2244,6 +2361,9 @@ final class RosterModel {
         chats = [:]
         liveSessions = [:]
         unclaimed = [:]
+        connectionUpdates = [:]
+        connectionMemory.clear()
+        turnsEndedUnclaimed = [:]
         // A look asked for on the gateway being left is not for the next one.
         lookAgain = nil
         endedLately = []

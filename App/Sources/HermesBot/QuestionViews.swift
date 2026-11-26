@@ -33,6 +33,15 @@ struct QuestionCard: View {
                 SecretCard(asked: asked, name: name, prompt: prompt, bot: bot, look: look, gatewayName: gatewayName) { chat.questions.answer(asked.instance, with: $0, for: bot) }
             case .sudo(let command):
                 SudoCard(asked: asked, command: command, bot: bot, look: look, gatewayName: gatewayName) { chat.questions.answer(asked.instance, with: $0, for: bot) }
+            case .connection(let connection):
+                ConnectionCard(asked: asked, connection: connection, bot: bot, look: look, gatewayName: gatewayName,
+                               mayAct: { chat.questions.mayAct(asked.instance) },
+                               retry: { chat.questions.retry(asked.instance, row: $0, for: bot) },
+                               opened: { chat.questions.opened(asked.instance, row: $0) },
+                               askedFields: chat.questions.fields(of: connection.opID),
+                               draft: { chat.questions.draft(of: connection.opID, row: $0, field: $1) },
+                               setDraft: { chat.questions.setDraft($2, of: connection.opID, row: $0, field: $1) },
+                               clearDrafts: { chat.questions.clearDrafts(of: connection.opID, row: $0) }) { chat.questions.respond(asked.instance, with: $0, for: bot) }
             }
         }
         .padding(14)
@@ -49,7 +58,7 @@ struct QuestionCard: View {
 
 /// The parts every card is made of.
 enum CardParts {
-    static func header(_ symbol: String, _ title: String, waits: Duration?, since: Date, _ theme: Theme) -> some View {
+    static func header(_ symbol: String, _ title: String, waits: Duration?, since: Date, until deadline: Date? = nil, _ theme: Theme) -> some View {
         HStack(spacing: 7) {
             Image(systemName: symbol)
                 .font(.system(size: 11, weight: .medium))
@@ -59,7 +68,9 @@ enum CardParts {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(theme.text)
             Spacer(minLength: 8)
-            if let waits {
+            if let deadline {
+                Countdown(until: deadline)
+            } else if let waits {
                 Countdown(until: since.addingTimeInterval(Double(waits.components.seconds)))
             }
         }
@@ -94,7 +105,8 @@ enum CardParts {
 
     /// A small label at the end of a well.
     static func tag(_ text: String, _ theme: Theme) -> some View {
-        Text(text)
+        Text(verbatim: text)
+            .lineLimit(1)
             .font(.system(size: 11))
             .foregroundStyle(theme.secondaryText)
             .padding(.horizontal, 7)
@@ -154,7 +166,7 @@ struct CardButton: View {
                     .padding(.horizontal, 12)
                     .frame(height: 28)
                     .background(background(theme, isHovered), in: Capsule())
-                    .overlay(Capsule().strokeBorder(style == .primary ? .clear : theme.hairline))
+                    .overlay(Capsule().strokeBorder(style == .primary && isEnabled ? .clear : theme.hairline))
                     .contentShape(Capsule())
             }
         }
@@ -186,7 +198,9 @@ struct Countdown: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
-            let left = max(0, Int(until.timeIntervalSince(context.date).rounded(.up)))
+            let seconds = until.timeIntervalSince(context.date).rounded(.up)
+            // Bounded before it is made a whole number: a time far off must not trap.
+            let left = seconds.isFinite ? Int(min(max(seconds, 0), 359_999)) : 0
             Text(left >= 60 ? "\(left / 60)m \(left % 60)s" : "\(left)s")
                 .font(.system(size: 12).monospacedDigit())
                 .foregroundStyle(Theme(scheme).secondaryText)
@@ -490,6 +504,467 @@ private struct SudoCard: View {
 
     private func skip() {
         if answer(.value("")) { value = "" }
+    }
+}
+
+/// App accounts to connect and MCP servers to install, one row each, as the connection card
+/// mock-up drew it. What each row will run or contact, and where its sign-in opens, is shown
+/// before anything is done; a sign-in opens in the browser only on a click, and only an https
+/// address (or one on this Mac). A value a row asks for goes only into the move that sends it.
+struct ConnectionCard: View {
+    let asked: ChatQuestions.Asked
+    let connection: ConnectionRequest
+    let bot: Bot
+    let look: AvatarLook
+    let gatewayName: String
+    let mayAct: () -> Bool
+    let retry: (String) -> Bool
+    let opened: (String) -> Void
+    /// Every field each row has asked for while the card may be answered, kept by the
+    /// gateway's `ConnectionMemory`.
+    let askedFields: [String: [ConnectionTarget.Field]]
+    /// What was typed into a row's plain field, kept by the chat while the card waits: it
+    /// stays once sent (Hermes keeps none from an approval that still lacked a required
+    /// value, so the next one sends it again), and over a switch of bot or a reconnect.
+    let draft: (String, String) -> String?
+    let setDraft: (String, String, String?) -> Void
+    let clearDrafts: (String) -> Void
+    let respond: (ConnectionAnswer) -> Bool
+    /// What is typed into each row's secret fields, by row and field: only here, and emptied
+    /// once sent or skipped, and when the card goes.
+    @State private var secrets: [String: [String: String]] = [:]
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.openURL) private var openURL
+
+    var body: some View {
+        let theme = Theme(scheme)
+        let targets = connection.targets
+        let isDirectory = connection.suggested != nil && targets.isEmpty
+        VStack(alignment: .leading, spacing: 10) {
+            CardParts.header("link", title, waits: nil, since: asked.asked, until: connection.deadline, theme)
+            RequestedBy(bot: bot, look: look, place: "On", gatewayName: gatewayName)
+            if isDirectory {
+                // The directory card: every app the gateway can connect. This app has no such list.
+                CardParts.note("info.circle", "\(bot.title) wants to show the apps you can connect. Hermes Bot can't list them here yet; connect them in Hermes's own app, then press Continue.", theme)
+                if let suggested = connection.suggested, !suggested.isEmpty {
+                    CardParts.note("star", "Suggested: " + suggested.map { ShownText.visible($0, oneLine: true) }.joined(separator: ", "), theme)
+                }
+            }
+            ForEach(targets) { target in
+                row(target, theme)
+            }
+            if let problem = asked.problem {
+                CardParts.note("exclamationmark.circle", problem, theme)
+            }
+            HStack(spacing: 8) {
+                let open = targets.filter(isSkippable)
+                if open.count > 1 {
+                    CardButton("Skip all", style: .quiet) {
+                        if respond(ConnectionAnswer(moves: Dictionary(open.map { ($0.name, .skip) }, uniquingKeysWith: { first, _ in first }))) {
+                            secrets = [:]
+                            for target in open { clearDrafts(target.name) }
+                        }
+                    }
+                }
+                Spacer()
+                if !targets.isEmpty {
+                    Text("\(targets.filter { $0.state == .connected }.count) of \(targets.count) ready")
+                        .font(.system(size: 12).monospacedDigit())
+                        .foregroundStyle(theme.secondaryText)
+                }
+                // Quiet while rows are still open: it leaves them as they are.
+                CardButton("Continue", style: isDirectory || connection.allResolved ? .primary : .plain) {
+                    if respond(ConnectionAnswer(isContinue: true)) { secrets = [:] }
+                }
+                .help(isDirectory || connection.allResolved ? "Done here" : "Done here: the bot carries on with what is connected, and the rest is left")
+            }
+        }
+        .disabled(asked.isMoving)
+        .onDisappear { secrets = [:] }
+    }
+
+    private var title: String {
+        let targets = connection.targets
+        let kinds = Set(targets.map(\.kind))
+        let one = targets.count == 1
+        if targets.isEmpty || kinds == [.connector] { return one ? "Connect an app" : "Connect apps" }
+        if kinds == [.mcp] { return one ? "Add an MCP server" : "Add MCP servers" }
+        if kinds == [.plugin] { return one ? "Install a plugin" : "Install plugins" }
+        if kinds == [.skill] { return one ? "Install a skill" : "Install skills" }
+        if kinds.isSubset(of: [.plugin, .skill]) { return "Install plugins & skills" }
+        if kinds.isSubset(of: [.connector, .mcp]) { return "Connect apps & servers" }
+        return "Connect apps & add tools"
+    }
+
+    /// A slug as a name: `google_drive` as "Google Drive". Hosted apps come with no name of
+    /// their own (only catalog rows do), as in Hermes's own card.
+    static func title(of slug: String) -> String {
+        let words = slug.split(whereSeparator: { $0 == "_" || $0 == "-" || $0 == " " })
+            .map { $0.lowercased() == "mcp" ? "MCP" : $0.prefix(1).uppercased() + $0.dropFirst() }
+        return words.isEmpty ? slug : words.joined(separator: " ")
+    }
+
+    /// Every value the row has asked for while the card has been open.
+    private func fields(of target: ConnectionTarget) -> [ConnectionTarget.Field] {
+        ConnectionTarget.merged(askedFields[target.name] ?? [], with: target.fields)
+    }
+
+    private func name(of target: ConnectionTarget) -> String {
+        ShownText.visible(target.title ?? Self.title(of: target.name), oneLine: true)
+    }
+
+    /// The person can still skip it: anything not done one way or the other.
+    private func isSkippable(_ target: ConnectionTarget) -> Bool {
+        ![.connected, .skipped, .notConnected].contains(target.state)
+    }
+
+    @ViewBuilder
+    private func row(_ target: ConnectionTarget, _ theme: Theme) -> some View {
+        let isDone = target.state == .connected || target.state == .skipped
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 10) {
+                Image(systemName: symbol(target))
+                    .font(.system(size: 12))
+                    .foregroundStyle(theme.secondaryText)
+                    .frame(width: 26, height: 26)
+                    .background(theme.raised, in: RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(theme.hairline))
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(verbatim: name(of: target))
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(target.state == .skipped ? theme.secondaryText : theme.text)
+                            .lineLimit(1)
+                        if !isDone { CardParts.tag(kindLabel(target), theme) }
+                    }
+                    if !isDone {
+                        Text(verbatim: subtitle(target))
+                            .font(.system(size: 12))
+                            .foregroundStyle(theme.secondaryText)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 8)
+                if target.state == .connected {
+                    Label(doneLabel(target), systemImage: target.caveat == nil ? "checkmark" : "exclamationmark.circle")
+                        .font(.system(size: 12))
+                        .foregroundStyle(theme.text)
+                } else if target.state == .skipped {
+                    Text("Skipped").font(.system(size: 12)).foregroundStyle(theme.secondaryText)
+                } else if isSkippable(target) {
+                    CardButton("Skip", style: .quiet) {
+                        if respond(ConnectionAnswer(moves: [target.name: .skip])) {
+                            secrets[target.name] = nil
+                            clearDrafts(target.name)
+                        }
+                    }
+                    actionButton(target)
+                }
+            }
+            if !isDone {
+                details(target, theme)
+            } else if target.state == .connected, let caveat = target.caveat {
+                CardParts.note("exclamationmark.triangle", "Done, but \(caveat).", theme)
+            }
+        }
+        .padding(isDone ? 8 : 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.codeBlock, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(theme.hairline))
+        .opacity(target.state == .skipped ? 0.7 : 1)
+    }
+
+    /// Fields are asked for where approving (or trying again) sends them.
+    private func asksForValues(_ target: ConnectionTarget) -> Bool {
+        guard target.kind != .connector, !fields(of: target).isEmpty, target.canBeApproved else { return false }
+        return target.move == .approve || target.move == .retry
+    }
+
+    @ViewBuilder
+    private func details(_ target: ConnectionTarget, _ theme: Theme) -> some View {
+        if let description = target.description {
+            Text(verbatim: ShownText.visible(description, oneLine: false, prose: true))
+                .font(.system(size: 12.5))
+                .foregroundStyle(theme.text)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        if let launch = target.launch {
+            // What it will run or contact, where, and with which variables, as the gateway gives it.
+            VStack(alignment: .leading, spacing: 4) {
+                Text(launch.isRemote ? "Contacts" : "Runs")
+                    .font(.system(size: 11))
+                    .foregroundStyle(theme.secondaryText)
+                CardParts.well(theme) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        CardParts.code(launch.target, theme, oneLine: launch.isRemote)
+                        if let cwd = launch.cwd {
+                            Text(verbatim: "In " + ShownText.visible(cwd, oneLine: true))
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .foregroundStyle(theme.secondaryText)
+                                .textSelection(.enabled)
+                        }
+                        if !launch.env.isEmpty {
+                            // Every name, however many: they are part of what is approved.
+                            Text(verbatim: "With " + launch.env.map { ShownText.visible($0, oneLine: true) }.joined(separator: ", "))
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .foregroundStyle(theme.secondaryText)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+            }
+        } else if target.kind == .mcp, target.move == .approve || target.move == .retry, !target.canBeApproved {
+            CardParts.note("exclamationmark.triangle", "Hermes didn't say what this server would run, so it can't be added from here.", theme)
+        }
+        if let source = target.source {
+            sourceLines(target, source, theme)
+        }
+        if !target.tools.isEmpty {
+            let shown = target.tools.prefix(3).map { String(ShownText.visible($0, oneLine: true).prefix(40)) }.joined(separator: ", ")
+            let more = target.tools.count > 3 ? " +\(target.tools.count - 3) more" : ""
+            CardParts.note("wrench.and.screwdriver", "Adds: \(shown)\(more)", theme)
+                .help(target.tools.prefix(50).map { String(ShownText.visible($0, oneLine: true).prefix(80)) }.joined(separator: "\n"))
+        }
+        if let scan = target.scan {
+            CardParts.note("exclamationmark.triangle", "Security scan: \(scan)", theme)
+        }
+        if case .open(let url) = target.move {
+            CardParts.note("globe", "Opens in your browser: \(ShownText.visible(url.host ?? "", oneLine: true))", theme)
+            if target.state == .initiated, asked.opened.contains(target.name) {
+                CardParts.note("hourglass", "Waiting for you to finish in your browser…", theme)
+            }
+        } else if target.hasUnopenableLink, target.state == .pending || target.state == .initiated {
+            CardParts.note("exclamationmark.triangle", "Hermes Bot won't open this sign-in link: it isn't a secure web address.", theme)
+        }
+        if let detail = target.detail, target.state != .connected {
+            CardParts.note(target.state == .failed || target.state == .expired ? "exclamationmark.triangle" : "info.circle", detail, theme)
+        }
+        if asksForValues(target) {
+            ForEach(fields(of: target)) { field in
+                fieldRow(target, field, theme)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sourceLines(_ target: ConnectionTarget, _ source: ConnectionTarget.Source, _ theme: Theme) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            if let repo = source.repo {
+                let commit = source.sha.map { " @ " + String(ShownText.visible($0, oneLine: true).prefix(12)) } ?? ""
+                let folder = source.subdir.map { " · " + ShownText.visible($0, oneLine: true) } ?? ""
+                Text(verbatim: ShownText.visible(repo, oneLine: true) + commit + folder)
+                    .font(.system(size: 11.5, design: .monospaced))
+                    .foregroundStyle(theme.text)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+                if target.kind == .plugin, source.pinnedCommit == nil {
+                    CardParts.note("exclamationmark.triangle", "Hermes didn't give the exact commit, so it can't be installed from here.", theme)
+                }
+            } else if target.kind == .skill {
+                Text(verbatim: "From the skills hub: " + ShownText.visible(target.name, oneLine: true))
+                    .font(.system(size: 11.5, design: .monospaced))
+                    .foregroundStyle(theme.text)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+            } else {
+                CardParts.note("exclamationmark.triangle", "Hermes didn't say where this comes from, so it can't be installed from here.", theme)
+            }
+            // The bot by its name, not its id on the gateway.
+            let into = source.targetProfile.map { "Installs into \($0 == bot.name ? bot.title : ShownText.visible($0, oneLine: true))" }
+            let platforms = source.platforms.isEmpty ? nil : "For " + source.platforms.map(Self.platform).joined(separator: ", ")
+            let line = [into, platforms].compactMap { $0 }.joined(separator: " · ")
+            if !line.isEmpty {
+                Text(verbatim: line)
+                    .font(.system(size: 12))
+                    .foregroundStyle(theme.secondaryText)
+                    .lineLimit(2)
+            }
+        }
+    }
+
+    /// A platform as people write it.
+    static func platform(_ name: String) -> String {
+        switch name.lowercased() {
+        case "macos", "darwin": "macOS"
+        case "linux": "Linux"
+        case "windows", "win32": "Windows"
+        default: ShownText.visible(name, oneLine: true)
+        }
+    }
+
+    @ViewBuilder
+    private func fieldRow(_ target: ConnectionTarget, _ field: ConnectionTarget.Field, _ theme: Theme) -> some View {
+        let label = ShownText.visible(field.name, oneLine: true)
+        let prompt = field.prompt.map { ShownText.visible($0, oneLine: true) }
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(verbatim: label)
+                    .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(theme.text)
+                    .lineLimit(1)
+                Spacer()
+                Text(field.isSecret ? (field.isRequired ? "Required · secret, not kept in this app or chat" : "Optional · secret, not kept in this app or chat")
+                     : field.isRequired ? "Required" : "Optional")
+                    .font(.system(size: 11))
+                    .foregroundStyle(theme.secondaryText)
+            }
+            if field.isSecret {
+                SecretField(placeholder: prompt ?? "Paste value for \(label)", value: binding(target, field), canReveal: true, submit: {})
+            } else {
+                TextField(prompt ?? label, text: binding(target, field))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12.5, design: .monospaced))
+                    .padding(.horizontal, 10)
+                    .frame(height: 32)
+                    .background(theme.composer, in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(theme.hairline))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func actionButton(_ target: ConnectionTarget) -> some View {
+        switch target.move {
+        case .none:
+            // A link refused here is said so in the row; nothing is under way to show.
+            if !target.hasUnopenableLink {
+                Text(workingLabel(target))
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme(scheme).secondaryText)
+            }
+        case .open(let url):
+            CardButton(asked.opened.contains(target.name) ? "Open again ↗" : openLabel(target), style: .primary) {
+                // A click, not in the moment the card came, and only an address checked as safe.
+                guard mayAct() else { return }
+                opened(target.name)
+                openURL(url)
+            }
+            .help(url.absoluteString)
+        case .approve:
+            if target.canBeApproved {
+                CardButton(approveLabel(target), style: .primary) { approve(target) }
+                    .disabled(!isFilled(target))
+            }
+        case .retry:
+            CardButton("Retry", style: .primary) {
+                if target.retriesByReissue {
+                    // A sign-in is minted afresh by the gateway; its link is opened only on a click.
+                    _ = retry(target.name)
+                } else {
+                    approve(target)
+                }
+            }
+            .disabled(!target.retriesByReissue && (!target.canBeApproved || !isFilled(target)))
+        }
+    }
+
+    /// What has been typed into a field: a secret here, anything else as the chat keeps it.
+    private func typed(_ target: ConnectionTarget, _ field: ConnectionTarget.Field) -> String? {
+        field.isSecret ? secrets[target.name]?[field.name] : draft(target.name, field.name)
+    }
+
+    private func isFilled(_ target: ConnectionTarget) -> Bool {
+        !fields(of: target).contains { $0.isRequired && !$0.isFilled(typed: typed(target, $0)) }
+    }
+
+    /// Approves a row (or runs it again) with every value it has asked for: the one rule for
+    /// what is sent is the field's own (`Field.value(typed:)`), so a secret's default never
+    /// goes. A plugin is pinned to the commit the card showed. Plain values stay in their
+    /// fields for a later approval; secrets are emptied once sent.
+    private func approve(_ target: ConnectionTarget) {
+        var sent: [String: String] = [:]
+        for field in fields(of: target) {
+            let value = field.value(typed: typed(target, field))
+            if !value.isEmpty { sent[field.name] = value }
+        }
+        if target.kind == .plugin, let commit = target.source?.pinnedCommit { sent["ref"] = commit }
+        if respond(ConnectionAnswer(moves: [target.name: .approve(values: sent)])) { secrets[target.name] = nil }
+    }
+
+    private func approveLabel(_ target: ConnectionTarget) -> String {
+        switch target.action {
+        case .install: "Install"
+        case .enable: "Enable"
+        case .authorize: "Authorize"
+        case .reconnect, .connect: "Connect"
+        }
+    }
+
+    private func openLabel(_ target: ConnectionTarget) -> String {
+        target.action == .install || target.action == .enable ? "Open in browser ↗" : "Open sign-in ↗"
+    }
+
+    /// What a row with nothing to do says: the gateway is at work on it.
+    private func workingLabel(_ target: ConnectionTarget) -> String {
+        if target.state == .pending { return "Getting the sign-in link…" }
+        return switch target.action {
+        case .install: "Installing…"
+        case .enable: "Enabling…"
+        case .authorize: "Authorizing…"
+        case .connect, .reconnect: "Connecting…"
+        }
+    }
+
+    private func binding(_ target: ConnectionTarget, _ field: ConnectionTarget.Field) -> Binding<String> {
+        Binding {
+            field.value(typed: typed(target, field))
+        } set: { value in
+            if field.isSecret { secrets[target.name, default: [:]][field.name] = value } else { setDraft(target.name, field.name, value) }
+        }
+    }
+
+    private func symbol(_ target: ConnectionTarget) -> String {
+        switch target.kind {
+        case .connector: "app.badge"
+        case .mcp: "server.rack"
+        case .plugin: "puzzlepiece.extension"
+        case .skill: "sparkles"
+        }
+    }
+
+    private func kindLabel(_ target: ConnectionTarget) -> String {
+        let kind = switch target.kind {
+        case .connector: "Hosted app"
+        case .mcp: "MCP server"
+        case .plugin: "Plugin"
+        case .skill: "Skill"
+        }
+        let tier: String? = switch target.tier {
+        case .official: "Official"
+        case .verified: "Verified"
+        case .community: "Community"
+        case nil: nil
+        }
+        return tier.map { "\($0) · \(kind)" } ?? kind
+    }
+
+    private func subtitle(_ target: ConnectionTarget) -> String {
+        switch target.state {
+        case .connected: return kindLabel(target)
+        case .skipped: return "Skipped"
+        case .expired: return "The sign-in ran out of time"
+        case .notConnected: return "Not connected"
+        case .failed: return "Didn't work"
+        case .pending, .initiated:
+            return switch target.action {
+            case .connect: "Connect your account"
+            case .reconnect: "Sign in again"
+            case .authorize: "Authorize on \(gatewayName)"
+            case .install: "Install on \(gatewayName)"
+            case .enable: "Enable on \(gatewayName)"
+            }
+        }
+    }
+
+    private func doneLabel(_ target: ConnectionTarget) -> String {
+        switch target.action {
+        case .install: "Installed"
+        case .enable: "Enabled"
+        case .authorize: "Authorized"
+        case .connect, .reconnect: "Connected"
+        }
     }
 }
 

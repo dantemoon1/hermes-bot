@@ -10,7 +10,8 @@ import Foundation
 @Observable
 final class ChatQuestions {
     struct Asked: Identifiable, Equatable {
-        let question: BotQuestion
+        /// What was asked, as the gateway last said it (a connection card changes as its rows do).
+        var question: BotQuestion
         /// The connection it came on: it is answered on that one or not at all.
         let client: GatewayClient
         /// When it reached the app. The gateway's deadline counts from here.
@@ -31,13 +32,24 @@ final class ChatQuestions {
         /// When our answer to a request went: a response frame is not acknowledged, so a
         /// deadline the gateway says passed just after can still be what happened.
         var answeredAt: Date?
+        /// A move on a connection card is on its way.
+        var isMoving = false
+        /// Rows of a connection card whose sign-in the person opened from it: only those are
+        /// said to be waiting on the browser (a link is minted before anyone clicks).
+        var opened: Set<String> = []
+        /// The line was said from what the app last saw, not from the gateway's own word on how
+        /// the card ended; that word, when it comes, takes its place.
+        var isProvisional = false
 
         var id: UUID { instance }
         var isOpen: Bool { if case .settled = state { false } else { true } }
 
+
+
         static func == (a: Asked, b: Asked) -> Bool {
             a.instance == b.instance && a.question == b.question && a.client === b.client && a.shown == b.shown
                 && a.state == b.state && a.problem == b.problem && a.endedMeanwhile == b.endedMeanwhile && a.answeredAt == b.answeredAt
+                && a.isMoving == b.isMoving && a.opened == b.opened && a.isProvisional == b.isProvisional
         }
     }
 
@@ -63,7 +75,17 @@ final class ChatQuestions {
         var wasLost = false
     }
 
-    private(set) var all: [Asked] = []
+    private(set) var all: [Asked] = [] {
+        // The memory keeps a card shown as waiting for as long as it is.
+        didSet { memory.setShown(Set(all.filter { $0.isOpen && { if case .connection = $0.question.kind { true } else { false } }($0) }.map(\.question.id)), owner: owner) }
+    }
+    /// The bot whose chat these questions are in (its profile), which owns its cards' memory.
+    var owner = ""
+    private func key(_ opID: String) -> ConnectionMemory.Key { .init(owner: owner, op: opID) }
+    /// What is kept for each connection card on this gateway while it may still be answered:
+    /// the fields it asked for and what was typed into the plain ones. One for the gateway,
+    /// shared by every chat (the roster hands it over); a chat alone has one of its own.
+    var memory = ConnectionMemory()
 
     /// How far the person has got through a set of clarifying questions, which are answered
     /// one at a time in the panel over the message box.
@@ -108,13 +130,19 @@ final class ChatQuestions {
         if let index = all.firstIndex(where: { $0.question.id == question.id }) {
             let was = all[index]
             let wasLost = if case .settled(let ending) = was.state { ending.wasLost } else { false }
+            if case .connection(let card) = question.kind { memory.heard(card, as: key(card.opID), inSession: question.sessionID) }
+            if !wasLost, was.client === client, case .connection(let update) = question.kind {
+                // The same card again (a chat's snapshot): it may say more than the one shown.
+                connectionChanged(update, inSession: question.sessionID, on: client)
+                return
+            }
             guard wasLost || (was.isOpen && was.client !== client) else { return }
             forgetWork(of: was.instance)
             all.remove(at: index)
         }
         let now = Date.now
-        all.append(Asked(question: question, client: client, asked: now, placed: max(now, notBefore ?? now),
-                         instance: UUID(), state: .open))
+        if case .connection(let card) = question.kind { memory.heard(card, as: key(card.opID), inSession: question.sessionID) }
+        all.append(Asked(question: question, client: client, asked: now, placed: max(now, notBefore ?? now), instance: UUID(), state: .open))
         trim()
     }
 
@@ -264,13 +292,174 @@ final class ChatQuestions {
     /// The bot's turn in a chat has ended. On the older route the gateway drops a request
     /// someone else answered without telling the other apps, so one still open here for that
     /// chat can no longer be answered: it is over, by whom not known. The session authority
-    /// says when each of its prompts is settled, so those are left to it.
+    /// says when each of its prompts is settled, so those are left to it. A connection card
+    /// holds its turn until it settles (`run.py`), so one still open when the turn ends had
+    /// its settling update missed: it is over too, until that update says how.
     func turnEnded(inSession sessionID: String, on client: GatewayClient) {
-        for index in all.indices where all[index].state == .open && all[index].client === client && all[index].question.sessionID == sessionID {
-            guard case .request = all[index].question.route else { continue }
-            all[index].state = .settled(Self.ending(endedBy: nil, all[index].question))
+        for index in all.indices where all[index].isOpen && all[index].client === client && all[index].question.sessionID == sessionID {
+            switch all[index].question.route {
+            case .request:
+                guard all[index].state == .open else { continue }
+                all[index].state = .settled(Self.ending(endedBy: nil, all[index].question))
+            case .connection:
+                all[index].state = .settled(Self.ending(endedBy: nil, all[index].question))
+                all[index].isProvisional = true
+            case .prompt:
+                continue
+            }
             forgetWork(of: all[index].instance)
         }
+    }
+
+    /// The gateway says what has changed on a connection card: its rows as they now stand,
+    /// and, once it is over, how. Only for the card it names, in the chat and on the
+    /// connection it names, and only a newer snapshot than the one shown (`updated(by:)`),
+    /// keeping what only the request carried. A line said provisionally gives way to the
+    /// gateway's own word on how the card ended.
+    func connectionChanged(_ update: ConnectionRequest, inSession sessionID: String?, on client: GatewayClient) {
+        guard let index = all.firstIndex(where: {
+            $0.question.id == update.opID && $0.client === client && (sessionID?.isEmpty != false || $0.question.sessionID == sessionID)
+        }), case .connection(let shown) = all[index].question.kind else { return }
+        // What a row asked for counts even from a snapshot older than the one shown.
+        memory.heard(update, as: key(update.opID), inSession: sessionID)
+        let provisional = all[index].isProvisional
+        guard all[index].isOpen || (provisional && update.isSettled), let now = shown.updated(by: update) else { return }
+        let asked = all[index].question
+        all[index].question = BotQuestion(id: asked.id, sessionID: asked.sessionID, route: .connection, kind: .connection(now), waits: asked.waits)
+        // A row tried again, here or elsewhere, has a fresh link, which it has not opened.
+        for target in now.targets {
+            let before = shown.targets.first { $0.name == target.name }
+            if target.state != .initiated || before?.connectURL != target.connectURL { all[index].opened.remove(target.name) }
+        }
+        if now.isSettled {
+            all[index].state = .settled(Self.ending(for: now))
+            all[index].isProvisional = false
+            forgetWork(of: all[index].instance)
+        }
+    }
+
+    /// The gateway no longer has this connection card open (asked after its turn ended).
+    func connectionGone(_ opID: String, on client: GatewayClient) {
+        guard let index = all.firstIndex(where: { $0.question.id == opID && $0.client === client && $0.isOpen }) else { return }
+        connectionClosedElsewhere(all[index].instance)
+    }
+
+    /// Makes the person's moves on a connection card: a row skipped, approved with its
+    /// values, or Continue. The card stays until the gateway says it is over. Returns whether
+    /// the moves went (not in the moment the card arrived, nor while another is on its way).
+    @discardableResult
+    func respond(_ instance: UUID, with answer: ConnectionAnswer, for bot: Bot) -> Bool {
+        guard let index = all.firstIndex(where: { $0.instance == instance }), all[index].state == .open, !all[index].isMoving,
+              isSettledIn(all[index]), case .connection(let connection) = all[index].question.kind else { return false }
+        let asked = all[index]
+        all[index].isMoving = true
+        all[index].problem = nil
+        Task {
+            do {
+                let settled = try await asked.client.respond(to: connection, inSession: asked.question.sessionID, with: answer, profile: bot.name)
+                guard let now = all.firstIndex(where: { $0.instance == instance }) else { return }
+                all[now].isMoving = false
+                // Over, and the gateway's own word on how has not come: said from what is
+                // shown for now, and replaced by that word when it comes.
+                if settled { memory.finish(key(connection.opID)) }
+                if settled, all[now].isOpen, case .connection(let latest) = all[now].question.kind {
+                    all[now].state = .settled(Self.ending(for: latest, continued: answer.isContinue))
+                    all[now].isProvisional = true
+                    forgetWork(of: instance)
+                }
+            } catch is GatewayClient.ConnectionOver {
+                connectionClosedElsewhere(instance)
+            } catch {
+                guard let now = all.firstIndex(where: { $0.instance == instance }) else { return }
+                all[now].isMoving = false
+                if all[now].isOpen { all[now].problem = "Couldn't send that. \(GatewayProblem.text(for: error))" }
+            }
+        }
+        return true
+    }
+
+    /// Asks the gateway to try a failed or expired row again (a hosted app's sign-in: Hermes
+    /// mints a fresh link through `connectors.connect`). The new link is shown on the row and
+    /// opened only when the person clicks it. Returns whether it went.
+    @discardableResult
+    func retry(_ instance: UUID, row name: String, for bot: Bot) -> Bool {
+        guard let index = all.firstIndex(where: { $0.instance == instance }), all[index].state == .open, !all[index].isMoving,
+              isSettledIn(all[index]), case .connection(let connection) = all[index].question.kind else { return false }
+        let asked = all[index]
+        all[index].isMoving = true
+        all[index].problem = nil
+        all[index].opened.remove(name)
+        Task {
+            do {
+                let now = try await asked.client.retry(name, of: connection, inSession: asked.question.sessionID, profile: bot.name)
+                guard let at = all.firstIndex(where: { $0.instance == instance }) else { return }
+                all[at].isMoving = false
+                if let now { connectionChanged(now, inSession: asked.question.sessionID, on: asked.client) }
+            } catch is GatewayClient.ConnectionOver {
+                connectionClosedElsewhere(instance)
+            } catch {
+                guard let at = all.firstIndex(where: { $0.instance == instance }) else { return }
+                all[at].isMoving = false
+                if all[at].isOpen { all[at].problem = "Couldn't try that again. \(GatewayProblem.text(for: error))" }
+            }
+        }
+        return true
+    }
+
+    /// The person opened a row's sign-in from the card.
+    func opened(_ instance: UUID, row name: String) {
+        guard let index = all.firstIndex(where: { $0.instance == instance }) else { return }
+        all[index].opened.insert(name)
+    }
+
+    /// The gateway has no such card open any more: it settled, here or on another device,
+    /// and its last word did not reach this app. Over, until that word says how.
+    private func connectionClosedElsewhere(_ instance: UUID) {
+        guard let index = all.firstIndex(where: { $0.instance == instance }) else { return }
+        all[index].isMoving = false
+        guard all[index].isOpen else { return }
+        all[index].state = .settled(Ending(mark: .none, text: "Answered elsewhere"))
+        all[index].isProvisional = true
+        forgetWork(of: instance)
+        // The gateway has it closed: nothing kept for it is needed.
+        memory.finish(key(all[index].question.id))
+    }
+
+    /// Something on the card may be done now: past the moment it arrived.
+    func mayAct(_ instance: UUID) -> Bool {
+        all.first(where: { $0.instance == instance }).map { $0.state == .open && isSettledIn($0) } ?? false
+    }
+
+    /// The line a connection card leaves: each row as it ended. `continued` says the person
+    /// pressed Continue, which leaves what was not finished as it was.
+    static func ending(for connection: ConnectionRequest, continued: Bool = false) -> Ending {
+        let timedOut = connection.settledBy == "deadline"
+        if connection.targets.isEmpty {
+            // The directory card, or a card with no rows this app could read.
+            let text = timedOut ? "Timed out" : connection.settledBy == "interrupt" ? "Stopped" : connection.suggested != nil ? "Saw the apps to connect" : "Done"
+            return Ending(mark: timedOut ? .timedOut : .none, text: text)
+        }
+        let stopped = continued || connection.settledBy == "continue"
+        let rows = connection.targets.map { target -> String in
+            let name = ShownText.visible(target.title ?? ConnectionCard.title(of: target.name), oneLine: true)
+            switch target.state {
+            case .connected:
+                let done = switch target.action {
+                case .install: "Installed \(name)"
+                case .enable: "Enabled \(name)"
+                case .authorize: "Authorized \(name)"
+                case .reconnect: "Reconnected \(name)"
+                case .connect: "Connected \(name)"
+                }
+                return target.caveat.map { "\(done), but \($0)" } ?? done
+            case .skipped: return "Skipped \(name)"
+            case .failed: return "\(name) didn't work"
+            default: return stopped ? "Left \(name)" : "\(name) not finished"
+            }
+        }
+        let text = (timedOut ? ["Timed out"] : connection.settledBy == "interrupt" ? ["Stopped"] : []) + rows
+        let allConnected = connection.targets.allSatisfy { $0.state == .connected && $0.caveat == nil }
+        return Ending(mark: timedOut ? .timedOut : allConnected ? .allowed : .none, text: text.joined(separator: " · "))
     }
 
     /// The connection these questions came on has gone. They can no longer be answered there.
@@ -286,6 +475,7 @@ final class ChatQuestions {
         for lock in locks.values { lock.cancel() }
         locks = [:]
         progress = [:]
+        memory.clear()
         all = []
     }
 
@@ -347,6 +537,26 @@ final class ChatQuestions {
         progress[instance] = nil
     }
 
+    /// Every field each row of a connection card has asked for while it may be answered.
+    func fields(of opID: String) -> [String: [ConnectionTarget.Field]] {
+        memory.fields(of: key(opID))
+    }
+
+    /// What was typed into a plain field of a connection card, if anything.
+    func draft(of opID: String, row: String, field: String) -> String? {
+        memory.draft(of: key(opID), row: row, field: field)
+    }
+
+    /// Notes what is typed into a plain field of a connection card still waiting.
+    func setDraft(_ value: String?, of opID: String, row: String, field: String) {
+        memory.setDraft(value, of: key(opID), row: row, field: field)
+    }
+
+    /// Lets go of what was typed into one row of a connection card (it was skipped).
+    func clearDrafts(of opID: String, row: String) {
+        memory.clearDrafts(of: key(opID), row: row)
+    }
+
     private func trim() {
         var settled = all.filter { !$0.isOpen }
         guard settled.count > Self.kept else { return }
@@ -376,7 +586,7 @@ final class ChatQuestions {
             case .site(let host, _): host
             }
         case .secret(let name, _): name.isEmpty ? nil : name
-        case .sudo, .clarify: nil
+        case .sudo, .clarify, .connection: nil
         }
     }
 
@@ -421,6 +631,8 @@ final class ChatQuestions {
             return Ending(mark: .none, text: "Skipped", detail: detail)
         case (.sudo, _):
             return Ending(mark: .none, text: "Skipped the password")
+        case (.connection(let connection), _):
+            return ending(for: connection)
         }
     }
 }
