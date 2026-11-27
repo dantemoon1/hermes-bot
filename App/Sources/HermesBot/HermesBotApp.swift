@@ -127,6 +127,9 @@ struct HermesBotApp: App {
     private var hasChat: Bool { canMove && roster.selected.map { roster.chat(for: $0).phase == .loaded } == true }
 }
 
+/// The window's own coordinate space, in which the reaction capsule is placed.
+let appWindowSpace = "main window"
+
 struct MainWindow: View {
     let roster: RosterModel
     @Binding var panel: Panel?
@@ -146,6 +149,8 @@ struct MainWindow: View {
     @State private var deleteProblem: String?
     /// What pin or mark from a row's menu did not stay, and why.
     @State private var menuProblem: (what: String, why: String)?
+    /// The reaction picker open in the chat, if one is.
+    @State private var reactionPicker: ReactionPickerTarget?
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -165,6 +170,18 @@ struct MainWindow: View {
                 .allowsHitTesting(panel == nil)
                 .environment(\.isCovered, panel != nil)
                 .accessibilityHidden(panel != nil)
+                .coordinateSpace(name: appWindowSpace)
+                .onKeyPress(.escape, phases: .down) { _ in
+                    guard reactionPicker != nil else { return .ignored }
+                    reactionPicker = nil
+                    return .handled
+                }
+                .overlay {
+                    if let target = reactionPicker, let bot = roster.selected {
+                        reactionOverlay(target, bot: bot)
+                            .ignoresSafeArea()
+                    }
+                }
                 .overlay {
                     if let panel {
                         ZStack {
@@ -200,6 +217,7 @@ struct MainWindow: View {
                 }
                 .animation(.easeOut(duration: 0.15), value: panel)
                 .onChange(of: panel) { _, now in
+                    if now != nil { reactionPicker = nil }
                     switch now {
                     case .search:
                         searchOpens += 1
@@ -282,6 +300,42 @@ struct MainWindow: View {
         }
     }
 
+    /// A click anywhere outside the capsule closes it, as a popover's would.
+    private func reactionOverlay(_ target: ReactionPickerTarget, bot: Bot) -> some View {
+        ZStack {
+            Color.black.opacity(0.001)
+                .contentShape(Rectangle())
+                .onTapGesture { reactionPicker = nil }
+            GeometryReader { space in
+                let width = ReactionCapsule.width
+                let height = ReactionCapsule.height
+                let leading = (showsRail ? RosterView.compactWidth : RosterView.width) + 1
+                let trailing = showsDetails ? DetailsPanel.width + 1 : 0
+                let minX = leading + 8 + width / 2
+                let maxX = max(minX, space.size.width - trailing - 8 - width / 2)
+                let x = min(max(target.anchor.minX - 4 + width / 2, minX), maxX)
+                let aboveTop = target.anchor.minY - 8 - height
+                let belowTop = target.anchor.maxY + 8
+                // The bot's name pill owns the top 56 points; the composer owns the bottom.
+                let minTop: CGFloat = 56
+                let maxTop = max(minTop, space.size.height - 70 - height)
+                let useAbove = aboveTop >= minTop || belowTop > maxTop
+                let top = min(max(useAbove ? aboveTop : belowTop, minTop), maxTop)
+                ReactionCapsule(row: target.row, bot: bot, roster: roster) {
+                    reactionPicker = nil
+                }
+                .background {
+                    // Escape closes it wherever the caret is, as a popover's would.
+                    Button("Close") { reactionPicker = nil }
+                        .keyboardShortcut(.cancelAction)
+                        .opacity(0)
+                        .accessibilityHidden(true)
+                }
+                .position(x: x, y: top + height / 2)
+            }
+        }
+    }
+
     private func main(_ theme: Theme) -> some View {
         HStack(spacing: 0) {
             RosterView(
@@ -304,7 +358,7 @@ struct MainWindow: View {
             ZStack(alignment: .top) {
                 theme.canvas
                 if let bot = roster.selected {
-                    ChatView(bot: bot, roster: roster)
+                    ChatView(bot: bot, roster: roster, reactionPicker: $reactionPicker)
                         // A fresh view per bot: scroll position and retries belong to one chat.
                         .id(bot.id)
                         .environment(\.pillWidth, pillWidth)

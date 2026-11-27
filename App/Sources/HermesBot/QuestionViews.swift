@@ -568,7 +568,7 @@ struct ConnectionCard: View {
                 }
                 Spacer()
                 if !targets.isEmpty {
-                    Text("\(targets.filter { $0.state == .connected }.count) of \(targets.count) ready")
+                    Text(Self.progress(of: targets))
                         .font(.system(size: 12).monospacedDigit())
                         .foregroundStyle(theme.secondaryText)
                 }
@@ -581,6 +581,10 @@ struct ConnectionCard: View {
         }
         .disabled(asked.isMoving)
         .onDisappear { secrets = [:] }
+    }
+
+    static func progress(of targets: [ConnectionTarget]) -> String {
+        "\(targets.filter(\.isResolved).count) of \(targets.count) done"
     }
 
     private var title: String {
@@ -635,9 +639,16 @@ struct ConnectionCard: View {
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(target.state == .skipped ? theme.secondaryText : theme.text)
                             .lineLimit(1)
+                            .layoutPriority(1)
+                        if target.kind == .connector, let alias = target.alias {
+                            Text(verbatim: "· " + ShownText.visible(alias, oneLine: true))
+                                .font(.system(size: 12))
+                                .foregroundStyle(theme.secondaryText)
+                                .lineLimit(1)
+                        }
                         if !isDone { CardParts.tag(kindLabel(target), theme) }
                     }
-                    if !isDone {
+                    if !isDone, Self.showsSubtitle(for: target) {
                         Text(verbatim: subtitle(target))
                             .font(.system(size: 12))
                             .foregroundStyle(theme.secondaryText)
@@ -738,7 +749,7 @@ struct ConnectionCard: View {
         } else if target.hasUnopenableLink, target.state == .pending || target.state == .initiated {
             CardParts.note("exclamationmark.triangle", "Hermes Bot won't open this sign-in link: it isn't a secure web address.", theme)
         }
-        if let detail = target.detail, target.state != .connected {
+        if let detail = Self.shownDetail(of: target), target.state != .connected {
             CardParts.note(target.state == .failed || target.state == .expired ? "exclamationmark.triangle" : "info.circle", detail, theme)
         }
         if asksForValues(target) {
@@ -746,6 +757,14 @@ struct ConnectionCard: View {
                 fieldRow(target, field, theme)
             }
         }
+    }
+
+    static func showsSubtitle(for target: ConnectionTarget) -> Bool {
+        target.state != .expired || target.detail == nil
+    }
+
+    static func shownDetail(of target: ConnectionTarget) -> String? {
+        target.detail
     }
 
     @ViewBuilder
@@ -756,7 +775,7 @@ struct ConnectionCard: View {
                 let folder = source.subdir.map { " · " + ShownText.visible($0, oneLine: true) } ?? ""
                 Text(verbatim: ShownText.visible(repo, oneLine: true) + commit + folder)
                     .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(theme.text)
+                    .foregroundStyle(theme.secondaryText)
                     .lineLimit(2)
                     .textSelection(.enabled)
                 if target.kind == .plugin, source.pinnedCommit == nil {
@@ -765,7 +784,7 @@ struct ConnectionCard: View {
             } else if target.kind == .skill {
                 Text(verbatim: "From the skills hub: " + ShownText.visible(target.name, oneLine: true))
                     .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(theme.text)
+                    .foregroundStyle(theme.secondaryText)
                     .lineLimit(2)
                     .textSelection(.enabled)
             } else {
@@ -1032,7 +1051,7 @@ struct QuestionLine: View {
 }
 
 /// A bot's clarifying questions, one at a time, in a panel docked over the message box, as
-/// a coding assistant asks its questions. A choice is picked by a
+/// T3 Code asks its questions. A choice is picked by a
 /// click or by its number while the message box is empty; words typed in the message box
 /// are the answer instead. Return answers the question showing and moves on, and the
 /// whole set goes once the last is answered.

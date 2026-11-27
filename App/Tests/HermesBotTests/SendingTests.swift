@@ -17,24 +17,61 @@ struct SendingTests {
         /// the answer to it, as Hermes does unless set otherwise, and "queue" makes it wait.
         /// `extra` is a further word for a mode that takes one, such as the port that
         /// "redirects" sends its askers on to.
-        init(port: Int = Int.random(in: 20000..<40000), whenBusy: String = "interrupt", extra: String? = nil) async throws {
-            address = "127.0.0.1:\(port)"
-            self.port = port
+        init(port: Int = 0, whenBusy: String = "interrupt", extra: String? = nil) async throws {
             let script = URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
                 .appendingPathComponent("Tools/fake-gateway.py")
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = ["python3", script.path, String(port), whenBusy] + (extra.map { [$0] } ?? [])
+            // Port 0 lets the system choose: a random one can still be held by the last
+            // test's gateway, which is then what this test would find itself talking to.
+            // The child writes the port it has bound to a file, since its stdout is shut.
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
+            let portFile = FileManager.default.temporaryDirectory
+                .appendingPathComponent("hermes-pretend-\(UUID().uuidString)")
+            var environment = ProcessInfo.processInfo.environment
+            environment["HERMES_PRETEND_PORT_FILE"] = portFile.path
+            process.environment = environment
             try process.run()
+            defer { try? FileManager.default.removeItem(at: portFile) }
+            var bound: Int?
+            for _ in 0..<100 {
+                if let written = try? String(contentsOf: portFile, encoding: .utf8) {
+                    bound = Int(written.trimmingCharacters(in: .whitespacesAndNewlines))
+                    if bound != nil { break }
+                }
+                if !process.isRunning { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            guard let bound else {
+                process.terminate()
+                process.waitUntilExit()
+                throw StartupError(process.isRunning
+                    ? "The pretend gateway did not say which port it bound within five seconds."
+                    : "The pretend gateway exited before saying which port it bound.")
+            }
+            guard port == 0 || bound == port else {
+                process.terminate()
+                process.waitUntilExit()
+                throw StartupError("The pretend gateway bound port \(bound) instead of \(port).")
+            }
+            self.port = bound
+            address = "127.0.0.1:\(bound)"
             // Up when it answers.
             let status = URL(string: "http://\(address)/api/status")!
             for _ in 0..<100 {
                 if (try? await URLSession.shared.data(from: status)) != nil { return }
                 try await Task.sleep(for: .milliseconds(50))
             }
-            throw CocoaError(.fileNoSuchFile)
+            process.terminate()
+            process.waitUntilExit()
+            throw StartupError("The pretend gateway on port \(bound) did not answer within five seconds.")
+        }
+
+        struct StartupError: Error, CustomStringConvertible {
+            let description: String
+            init(_ description: String) { self.description = description }
         }
 
         deinit { process.terminate() }
@@ -416,8 +453,8 @@ struct SendingTests {
     /// The gateway restarts. The first send finds the connection gone; the next one gets
     /// through on a fresh connection, without the app being restarted.
     @Test func sendingWorksAgainOnceTheGatewayIsBack() async throws {
-        let port = Int.random(in: 40000..<50000)
-        var pretend: Pretend? = try await Pretend(port: port)
+        var pretend: Pretend? = try await Pretend()
+        let port = try #require(pretend).port
         let (roster, bot, chat) = try await open(try #require(pretend))
         pretend?.process.terminate()
         pretend?.process.waitUntilExit()

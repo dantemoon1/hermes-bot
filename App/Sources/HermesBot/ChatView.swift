@@ -60,7 +60,7 @@ final class ChatModel {
     private(set) var latest: LatestTurn?
     /// Reactions on stored rows, by row.
     private(set) var reactions: [Int: [Reaction]] = [:]
-    /// The emoji offered for reacting, as the sketch the owner chose has them.
+    /// The emoji offered for reacting.
     static let quickReactions = ["👍", "❤️", "😂", "😮", "🙏", "👀"]
     /// This gateway keeps no reactions, so none are offered.
     private(set) var cannotReact = false
@@ -1839,9 +1839,17 @@ extension GatewayProblem {
     }
 }
 
+/// Where the reaction picker is open: on which stored row, with the button it floats over
+/// in the window's own coordinates.
+struct ReactionPickerTarget {
+    let row: Int
+    var anchor: CGRect
+}
+
 struct ChatView: View {
     let bot: Bot
     let roster: RosterModel
+    @Binding var reactionPicker: ReactionPickerTarget?
     /// Raised by Try Again. Part of the load's identity, so a retry is cancelled like any
     /// other load when another bot is selected.
     @State private var attempt = 0
@@ -2154,10 +2162,11 @@ struct ChatView: View {
         case .bot(let id, let text):
             WithActions(
                 text: text, isLeading: true,
-                react: chat.canReact(id) ? { chat.react($0, to: id, of: bot, through: roster) } : nil,
-                mine: chat.myReaction(on: id),
+                canReact: chat.canReact(id),
                 turnAction: chat.canRetry(id) ? .retry { chat.retry(bot, through: roster) } : nil,
-                hasReactions: !(chat.reactions[id] ?? []).isEmpty
+                hasReactions: !(chat.reactions[id] ?? []).isEmpty,
+                reactionPicker: $reactionPicker,
+                reactionRow: id
             ) {
                 // As wide as its words and no wider than 560, so the buttons sit beside it.
                 NoWiderThan(width: 560) {
@@ -2185,7 +2194,8 @@ struct ChatView: View {
                         WithActions(
                             text: "", isLeading: false,
                             turnAction: chat.canUndo(id) ? .undo { chat.undo(bot, through: roster) } : nil,
-                            hasReactions: !(chat.reactions[id] ?? []).isEmpty
+                            hasReactions: !(chat.reactions[id] ?? []).isEmpty,
+                            reactionPicker: $reactionPicker
                         ) {
                             SentAttachments(picked: onItsWay, images: parts.images, files: parts.files, bot: bot, roster: roster)
                                 .reactions(chat.reactions[id] ?? [], isLeading: false, canChange: false) { _ in }
@@ -2198,7 +2208,8 @@ struct ChatView: View {
                     WithActions(
                         text: words, isLeading: false,
                         turnAction: chat.canUndo(id) ? .undo { chat.undo(bot, through: roster) } : nil,
-                        hasReactions: !(chat.reactions[id] ?? []).isEmpty
+                        hasReactions: !(chat.reactions[id] ?? []).isEmpty,
+                        reactionPicker: $reactionPicker
                     ) {
                         NoWiderThan(width: 560) {
                             bubble(item, words, chat, theme)
@@ -2464,20 +2475,27 @@ private struct WithActions<Bubble: View>: View {
     let text: String
     /// The bubble sits at the leading edge, as a bot's does, with the buttons after it.
     let isLeading: Bool
-    /// Sets the person's reaction. Nil where none can be set.
-    var react: ((String) -> Void)? = nil
-    /// The person's reaction now, marked in the picker.
-    var mine: String? = nil
+    /// This row can take the person's reaction.
+    var canReact = false
     var turnAction: TurnAction? = nil
     /// Reaction pills hang under the bubble, and the buttons line up with the bubble, not them.
     var hasReactions = false
+    @Binding var reactionPicker: ReactionPickerTarget?
+    /// The stored row a reaction would go on. Nil for the person's own messages.
+    var reactionRow: Int? = nil
     @ViewBuilder let bubble: Bubble
     @State private var isHovered = false
     @State private var copied = 0
     @State private var showsCopied = false
-    @State private var isPicking = false
+    /// Where Add reaction is in the window, so the floating capsule can follow it.
+    @State private var reactAt = CGRect.zero
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var isPicking: Bool {
+        guard let reactionRow else { return false }
+        return reactionPicker?.row == reactionRow
+    }
 
     var body: some View {
         let theme = Theme(scheme)
@@ -2490,9 +2508,11 @@ private struct WithActions<Bubble: View>: View {
         }
         .contentShape(Rectangle())
         .onHover { isHovered = $0 }
+        .onChange(of: isHovered) { if !isHovered, !isPicking { reactAt = .zero } }
         // Reacting stopped being possible with the picker up: it goes, and does not come back
         // by itself.
-        .onChange(of: react == nil) { if react == nil { isPicking = false } }
+        .onChange(of: canReact) { if !canReact, isPicking { reactionPicker = nil } }
+        .onDisappear { if isPicking { reactionPicker = nil } }
         .task(id: copied) {
             guard copied > 0 else { return }
             showsCopied = true
@@ -2518,26 +2538,37 @@ private struct WithActions<Bubble: View>: View {
     }
 
     @ViewBuilder private func reactButton(_ theme: Theme) -> some View {
-        if let react {
-            ActionButton(symbol: "smiley", label: "Add reaction", isLit: isPicking) { isPicking.toggle() }
-                .popover(isPresented: $isPicking, arrowEdge: .top) {
-                    HStack(spacing: 2) {
-                        ForEach(ChatModel.quickReactions, id: \.self) { emoji in
-                            EmojiChoice(emoji: emoji, isChosen: emoji == mine) {
-                                isPicking = false
-                                react(emoji)
-                            }
+        if canReact, let reactionRow {
+            let button = ActionButton(symbol: "smiley", label: "Add reaction", isLit: isPicking) {
+                if isPicking {
+                    reactionPicker = nil
+                } else {
+                    reactionPicker = ReactionPickerTarget(row: reactionRow, anchor: reactAt)
+                }
+            }
+            if isHovered || isPicking {
+                button
+                    .onGeometryChange(for: CGRect.self) { proxy in
+                        proxy.frame(in: .named(appWindowSpace))
+                    } action: { frame in
+                        reactAt = frame
+                        // A keyboard-opened picker first learns where its button is; after that,
+                        // scrolling or a change in layout closes it rather than leaving it behind.
+                        if isPicking {
+                            if reactionPicker?.anchor == .zero { reactionPicker?.anchor = frame }
+                            else if reactionPicker?.anchor != frame { reactionPicker = nil }
                         }
                     }
-                    .padding(5)
-                }
+            } else {
+                button
+            }
         }
     }
 
     @ViewBuilder private func turnButton(_ theme: Theme) -> some View {
         switch turnAction {
-        case .retry(let retry)?: ActionButton(symbol: "arrow.clockwise", label: "Retry", action: retry)
-        case .undo(let undo)?: ActionButton(symbol: "arrow.uturn.backward", label: "Undo", action: undo)
+        case .retry(let retry)?: ActionButton(symbol: "arrow.clockwise", label: "Retry", size: 12.5, action: retry)
+        case .undo(let undo)?: ActionButton(symbol: "arrow.uturn.backward", label: "Undo", size: 12.5, action: undo)
         case nil: EmptyView()
         }
     }
@@ -2561,6 +2592,7 @@ private struct ActionButton: View {
     let symbol: String
     let label: String
     var isLit = false
+    var size: CGFloat = 11
     let action: () -> Void
     @State private var isOver = false
     @Environment(\.colorScheme) private var scheme
@@ -2571,7 +2603,7 @@ private struct ActionButton: View {
             Group {
                 // The system's smiley comes filled here whatever is asked; the reference's
                 // icons are all outlines, so this one is drawn.
-                if symbol == "smiley" { SmileyIcon() } else { Image(systemName: symbol).font(.system(size: 11, weight: .medium)) }
+                if symbol == "smiley" { SmileyIcon() } else { Image(systemName: symbol).font(.system(size: size, weight: .medium)) }
             }
                 .foregroundStyle(isOver || isLit ? theme.text : theme.secondaryText)
                 .frame(width: 26, height: 26)
@@ -2632,6 +2664,40 @@ private struct EmojiChoice: View {
     }
 }
 
+/// The reactions as a floating capsule, in the look of the bot's name pill.
+struct ReactionCapsule: View {
+    static let width: CGFloat = 200
+    static let height: CGFloat = 38
+
+    let row: Int
+    let bot: Bot
+    let roster: RosterModel
+    let close: () -> Void
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        let theme = Theme(scheme)
+        let chat = roster.chat(for: bot)
+        HStack(spacing: 2) {
+            ForEach(ChatModel.quickReactions, id: \.self) { emoji in
+                EmojiChoice(emoji: emoji, isChosen: emoji == chat.myReaction(on: row)) {
+                    close()
+                    chat.react(emoji, to: row, of: bot, through: roster)
+                }
+            }
+        }
+        .padding(.horizontal, 5)
+        .padding(.vertical, 4)
+        .frame(width: Self.width, height: Self.height)
+        .background(theme.control, in: Capsule())
+        .overlay(Capsule().strokeBorder(theme.hairline))
+        .shadow(color: theme.floatShadow, radius: 6, y: 2)
+        .onExitCommand(perform: close)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Reactions")
+    }
+}
+
 extension View {
     /// Reactions as small pills on the bubble's bottom edge, at its leading corner for a bot's
     /// reply and its trailing one for the person's message. One emoji from both sides is one
@@ -2669,8 +2735,8 @@ private struct ReactionPills: View {
         }
         .padding(.horizontal, 8)
         .frame(height: 24)
-        .background(isOver ? theme.raisedHover : isMine ? theme.chosen : theme.control, in: Capsule())
-        .overlay(Capsule().strokeBorder(isMine ? theme.text.opacity(0.16) : theme.hairline))
+        .background(isOver ? theme.reactionHover : isMine ? theme.chosen : theme.control, in: Capsule())
+        .overlay(Capsule().strokeBorder(isMine ? (isOver ? theme.reactionHoverEdge : theme.text.opacity(0.16)) : theme.hairline))
         // A ring of the page's own colour, so the pill sits clear of the bubble's edge.
         .background(Capsule().stroke(theme.canvas, lineWidth: 3))
     }

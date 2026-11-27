@@ -25,7 +25,7 @@ a bot is answering turns the answer to it, as the real gateway does by default, 
 the chat open sees every answer. Nothing here is real
 data; keep it that way, since screenshots of it get shared.
 """
-import base64, hashlib, json, re, socketserver, struct, sys, threading, time, uuid
+import base64, hashlib, json, os, re, socketserver, struct, sys, threading, time, uuid
 from urllib.parse import urlparse, parse_qs, unquote
 
 TOKEN = "demo"
@@ -1557,6 +1557,8 @@ class Handler(socketserver.StreamRequestHandler):
         wait = 6 if "short" in text else 300
         hosted = {"name": "notion", "kind": "connector", "action": "connect", "state": "initiated",
                   "connect_url": "https://auth.example.com/oauth/authorize?client=pretend&attempt=1"}
+        if "alias" in text:
+            hosted["alias"] = "work"
         filesystem = {"name": "filesystem", "kind": "mcp", "action": "install", "state": "pending",
                       "instructions": "Read and search files inside one allowed folder.",
                       "required_env": [{"name": "ALLOWED_ROOT", "required": True, "secret": False, "default": "/pretend/docs"},
@@ -1839,5 +1841,14 @@ if __name__ == "__main__":
     # For the modes that sign in, the extra word is how many seconds a session lasts.
     if BUSY_MODE in ("password", "password-only") and len(sys.argv) > 3:
         SESSION_LASTS = int(sys.argv[3])
+    server = Server(("127.0.0.1", port), Handler)
+    # Port 0 is the system's choice, which tests use so one cannot collide with a gateway
+    # another test has not yet reaped. Say the real one only once it is bound. The tests
+    # discard stdout, so they read it from this file instead.
+    port = server.server_address[1]
+    port_file = os.environ.get("HERMES_PRETEND_PORT_FILE")
+    if port_file:
+        with open(port_file, "w") as written:
+            written.write(str(port))
     print(f"Pretend gateway on http://127.0.0.1:{port}, token: {TOKEN}. Leave this running; Ctrl-C stops it.", flush=True)
-    Server(("127.0.0.1", port), Handler).serve_forever()
+    server.serve_forever()

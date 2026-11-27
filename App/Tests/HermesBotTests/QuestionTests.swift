@@ -1070,6 +1070,29 @@ struct QuestionTests {
         #expect(memory.entries[typed] != nil && memory.entries[shown] != nil)
     }
 
+    @Test func theCountIsOfRowsSettledNotOnlyConnected() {
+        let rows = [
+            ConnectionTarget(name: "connected", kind: .connector, action: .connect, state: .connected),
+            ConnectionTarget(name: "skipped", kind: .mcp, action: .install, state: .skipped),
+            ConnectionTarget(name: "installing", kind: .mcp, action: .install, state: .initiated),
+            ConnectionTarget(name: "expired", kind: .connector, action: .connect, state: .expired),
+        ]
+        #expect(ConnectionCard.progress(of: rows) == "2 of 4 done")
+    }
+
+    @Test func anExpiredRowsOwnDetailIsSaidOnce() {
+        let expired = ConnectionTarget(name: "notion", kind: .connector, action: .connect, state: .expired,
+                                       detail: "The sign-in link ran out.")
+        #expect(ConnectionCard.shownDetail(of: expired) == "The sign-in link ran out.")
+        #expect(!ConnectionCard.showsSubtitle(for: expired))
+        let noDetail = ConnectionTarget(name: "notion", kind: .connector, action: .connect, state: .expired)
+        #expect(ConnectionCard.showsSubtitle(for: noDetail))
+        let useful = ConnectionTarget(name: "notion", kind: .connector, action: .connect, state: .expired,
+                                      detail: "Use your work account when you sign in again.")
+        #expect(ConnectionCard.shownDetail(of: useful) == "Use your work account when you sign in again.")
+        #expect(!ConnectionCard.showsSubtitle(for: useful))
+    }
+
     @Test func aFailedAuthorizationIsTriedAgainWithAFreshLink() async throws {
         let pretend = try await Pretend()
         let (roster, bot, chat) = try await open(pretend)
