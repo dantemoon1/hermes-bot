@@ -491,7 +491,7 @@ struct QuestionsTests {
     @Test func aConnectionCardIsRead() throws {
         let event = GatewayEvent(type: "connection.request", payload: try json(#"""
         {"op_id":"op-1","seq":2,"deadline_at":2000000000,"timeout_seconds":300,"targets":[
-          {"name":"notion","kind":"connector","action":"connect","state":"pending","display":"Notion","connect_url":"https://auth.example.com/x","tools":["a","b"]},
+          {"name":"notion","kind":"connector","action":"connect","state":"pending","display":"Notion","alias":"work","connect_url":"https://auth.example.com/x","tools":["a","b"]},
           {"name":"fs","kind":"mcp","action":"install","state":"failed","detail":"bad key","tier":"community",
            "launch":{"kind":"stdio","target":"npx fs"},"scan":{"status":"warnings","summary":"network use"},
            "required_env":[{"name":"ROOT","required":true,"secret":false,"default":"/d"},{"name":"KEY","required":true,"secret":true,"default":""}]},
@@ -506,6 +506,8 @@ struct QuestionsTests {
         // A row of a kind this app does not know is left out rather than guessed at.
         #expect(card.targets.map(\.name) == ["notion", "fs"])
         #expect(card.targets[0].connectURL?.host == "auth.example.com")
+        #expect(card.targets[0].alias == "work")
+        #expect(card.targets[1].alias == nil)
         #expect(card.targets[1].fields.map(\.isSecret) == [false, true])
         #expect(card.targets[1].launch == ConnectionTarget.Launch(isRemote: false, target: "npx fs"))
         #expect(card.targets[1].scan == "warnings: network use")

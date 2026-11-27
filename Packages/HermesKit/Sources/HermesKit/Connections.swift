@@ -175,6 +175,8 @@ public struct ConnectionTarget: Sendable, Equatable, Identifiable {
     public let resolvedByGateway: Bool?
     /// The name to show, where the gateway gives one (catalog rows only).
     public let title: String?
+    /// The account of a hosted app this row connects or repairs, where the gateway names one.
+    public let alias: String?
     public let description: String?
     /// Why it failed, or what happened, or what it still waits for.
     public let detail: String?
@@ -285,6 +287,7 @@ public struct ConnectionTarget: Sendable, Equatable, Identifiable {
         self.state = state
         resolvedByGateway = if case .bool(let resolved)? = row["resolved"] { resolved } else { nil }
         title = text(row["display"])
+        alias = text(row["alias"])
         // A catalog row's one sentence, or the setup words Hermes gives an MCP row.
         description = text(row["description"]) ?? text(row["instructions"])
         detail = text(row["detail"])
@@ -355,13 +358,15 @@ public struct ConnectionTarget: Sendable, Equatable, Identifiable {
 
     public init(name: String, kind: Kind, action: Action, state: State, resolved: Bool? = nil, title: String? = nil,
                 description: String? = nil, detail: String? = nil, connectURL: URL? = nil, fields: [Field] = [],
-                launch: Launch? = nil, tools: [String] = [], tier: Tier? = nil, scan: String? = nil, source: Source? = nil, caveat: String? = nil) {
+                launch: Launch? = nil, tools: [String] = [], tier: Tier? = nil, scan: String? = nil, source: Source? = nil, caveat: String? = nil,
+                alias: String? = nil) {
         self.name = name
         self.kind = kind
         self.action = action
         self.state = state
         self.resolvedByGateway = resolved
         self.title = title
+        self.alias = alias
         self.description = description
         self.detail = detail
         self.connectURL = connectURL

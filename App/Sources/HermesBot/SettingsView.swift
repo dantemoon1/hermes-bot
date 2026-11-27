@@ -232,6 +232,7 @@ struct SettingsView: View {
                 .padding(.vertical, 10)
                 if let current = updates.current {
                     theme.hairline.frame(height: 1)
+                        .padding(.horizontal, 14)
                     HStack {
                         Text("Version \(current)")
                             .font(.system(size: 14))
@@ -245,6 +246,7 @@ struct SettingsView: View {
                     .frame(minHeight: 46)
                     if updates.isOn {
                         theme.hairline.frame(height: 1)
+                            .padding(.horizontal, 14)
                         HStack {
                             Text("Check for updates automatically")
                                 .font(.system(size: 14))
@@ -253,9 +255,9 @@ struct SettingsView: View {
                             Toggle("Check for updates automatically", isOn: Bindable(updates).checksAutomatically)
                                 .labelsHidden()
                                 .toggleStyle(.switch)
-                                .controlSize(.mini)
-                                // Neutral: blue is for unread and selection.
-                                .tint(theme.secondaryText)
+                                .controlSize(.small)
+                                // An on switch is a selection.
+                                .tint(theme.unread)
                         }
                         .padding(.horizontal, 14)
                         .frame(minHeight: 46)

@@ -36,6 +36,9 @@ public struct Theme: Sendable {
     public let findMatch: Color
     /// Behind the find gone to: the colour of a selection, as blue marks selection.
     public let findCurrent: Color
+    /// Under the pointer on the person's own reaction pill, and its edge then.
+    public let reactionHover: Color
+    public let reactionHoverEdge: Color
     /// The soft shadow under controls that float over content.
     public let floatShadow: Color
 
@@ -65,6 +68,9 @@ public struct Theme: Sendable {
         findMatch = dark ? .white.opacity(0.16) : .black.opacity(0.1)
         // The reference's selection, sampled from its screenshots in light and dark.
         findCurrent = Color(hex: dark ? 0x35557E : 0xB4D0F4)
+        // Dark already had a clear step; light needed a deeper one to answer the pointer.
+        reactionHover = dark ? raisedHover : Color(hex: 0xDCDCDC)
+        reactionHoverEdge = text.opacity(dark ? 0.16 : 0.24)
     }
 }
 

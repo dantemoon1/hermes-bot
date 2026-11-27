@@ -151,8 +151,8 @@ struct NewBotTests {
 
     /// The gateway restarted since the roster was read: making a bot reconnects, as sending does.
     @Test func makingABotWorksAfterTheGatewayComesBack() async throws {
-        let port = Int.random(in: 50000..<60000)
-        var pretend: SendingTests.Pretend? = try await SendingTests.Pretend(port: port)
+        var pretend: SendingTests.Pretend? = try await SendingTests.Pretend()
+        let port = try #require(pretend).port
         let roster = await open(try #require(pretend))
         pretend?.process.terminate()
         pretend?.process.waitUntilExit()

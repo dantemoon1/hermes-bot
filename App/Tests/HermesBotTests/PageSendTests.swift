@@ -33,7 +33,7 @@ struct PageSendTests {
 
         @MainActor init(_ bot: Bot, _ roster: RosterModel, height: CGFloat = 700) {
             window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: height), styleMask: [.borderless], backing: .buffered, defer: false)
-            window.contentView = NSHostingView(rootView: ChatView(bot: bot, roster: roster).frame(width: 640, height: height))
+            window.contentView = NSHostingView(rootView: ChatView(bot: bot, roster: roster, reactionPicker: .constant(nil)).frame(width: 640, height: height))
             window.orderFrontRegardless()
         }
 

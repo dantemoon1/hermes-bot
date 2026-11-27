@@ -284,7 +284,10 @@ struct PageTests {
         // again, which a page that came from nowhere could not survive.
         try await click(3)
         #expect(shown.opened.isEmpty)
-        for _ in 0..<200 where await shown.page("location.hash") != "#web" { try await Task.sleep(for: .milliseconds(25)) }
+        for _ in 0..<200 {
+            if await shown.page("location.hash") == "#web" { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
         #expect(await shown.page("location.hash") == "#web")
         #expect(shown.view.url?.absoluteString == "about:blank#web")
         _ = await shown.page("location.reload(); 1")
@@ -645,15 +648,48 @@ struct PageTests {
         """)
         #expect(more.map(\.name) == ["after-bang.js", "typed.js", "after-svg.js", "after-break.js"])
         #expect(PageFiles.wanted(in: "<!--!><script src=in-comment.js></script>--><script type=module nomodule src=m.js></script>").map(\.name) == ["m.js"])
-        // Linear however many comments a page holds.
-        let comments = String(repeating: "<!-- a comment -->", count: 100_000) + "<script src=end.js></script>"
-        let read = ContinuousClock.now
-        #expect(PageFiles.wanted(in: comments).map(\.name) == ["end.js"])
-        #expect(ContinuousClock.now - read < .seconds(3))
-        // Linear however many `./` a name begins with.
-        let started = ContinuousClock.now
-        #expect(PageFiles.key(String(repeating: "./", count: 500_000) + "a.js") == "a.js")
-        #expect(ContinuousClock.now - started < .seconds(1))
+        // Linear however many comments a page holds, and however many `./` a name begins
+        // with. Thread CPU time at two sizes is compared, so time spent waiting behind
+        // other processes does not decide either.
+        func threadCPUSeconds() -> Double {
+            var time = timespec()
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time)
+            return Double(time.tv_sec) + Double(time.tv_nsec) / 1_000_000_000
+        }
+        func measureCPU(_ work: () -> Void) -> Double {
+            let started = threadCPUSeconds()
+            work()
+            return threadCPUSeconds() - started
+        }
+        let fewerComments = String(repeating: "<!-- a comment -->", count: 500) + "<script src=end.js></script>"
+        let moreComments = String(repeating: "<!-- a comment -->", count: 2_000) + "<script src=end.js></script>"
+        // The quietest of interleaved reads is taken, so even a cache or clock change is
+        // not read as slower work. Small inputs are enough: the growth is what carries
+        // the check, and even a regression is quick enough to be reported.
+        _ = PageFiles.wanted(in: fewerComments)
+        var fewestComments = Double.greatestFiniteMagnitude
+        var mostComments = Double.greatestFiniteMagnitude
+        for _ in 0..<3 {
+            fewestComments = min(fewestComments, measureCPU { _ = PageFiles.wanted(in: fewerComments) })
+            mostComments = min(mostComments, measureCPU { _ = PageFiles.wanted(in: moreComments) })
+        }
+        let commentGrowth = mostComments / fewestComments
+        #expect(commentGrowth < 10, "grew \(commentGrowth)x for 4x the comments (short \(fewestComments)s of CPU, long \(mostComments)s)")
+        #expect(mostComments < 0.25, "4x the comments took \(mostComments)s of CPU")
+        #expect(PageFiles.wanted(in: moreComments).map(\.name) == ["end.js"])
+        let short = String(repeating: "./", count: 20_000) + "a.js"
+        let long = String(repeating: "./", count: 80_000) + "a.js"
+        _ = PageFiles.key(short)
+        var shortest = Double.greatestFiniteMagnitude
+        var longest = Double.greatestFiniteMagnitude
+        for _ in 0..<3 {
+            shortest = min(shortest, measureCPU { _ = PageFiles.key(short) })
+            longest = min(longest, measureCPU { _ = PageFiles.key(long) })
+        }
+        let growth = longest / shortest
+        #expect(growth < 10, "grew \(growth)x for 4x the name (short \(shortest)s of CPU, long \(longest)s)")
+        #expect(longest < 0.25, "4x the name took \(longest)s of CPU")
+        #expect(PageFiles.key(long) == "a.js")
         #expect(PageFiles.key(" ././chart.js\n") == "chart.js")
         // No more than so many.
         let many = (0..<20).map { "<script src=\"s\($0).js\"></script>" }.joined()
