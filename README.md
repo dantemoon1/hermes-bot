@@ -48,7 +48,7 @@ Tokens and sign-ins are kept in your Keychain, nowhere else. The app talks only 
 cd App && swift run HermesBot
 ```
 
-The app's tests start `Tools/fake-gateway.py`, a pretend gateway, so they need `python3`. To try the app against it: `python3 Tools/fake-gateway.py 9129` in one terminal, and `HERMES_URL=127.0.0.1:9129 HERMES_TOKEN=demo swift run HermesBot` in `App`.
+The app's tests start `Tools/fake-gateway.py`, a pretend gateway, so they need `python3`. Tests that put a window on screen are skipped unless `HERMES_UI_TESTS=1` is set. To try the app against it: `python3 Tools/fake-gateway.py 9129` in one terminal, and `HERMES_URL=127.0.0.1:9129 HERMES_TOKEN=demo swift run HermesBot` in `App`.
 
 `Tools/make-app.sh` makes `build/Hermes Bot.app` for Apple silicon and Intel, with updates off. With `SIGN_IDENTITY` set to a Developer ID and `NOTARY_PROFILE` to a stored `notarytool` profile, it also makes a signed, notarised `build/Hermes Bot.dmg`; a copy for other people also needs `BUILD` (higher than the last release's) and `SPARKLE_PUBLIC_ED_KEY` (the public half of the key that signs updates). `Tools/make-appcast.sh` signs a release's update feed, and `Tools/test-release.sh` tries both scripts with a throwaway key.
 

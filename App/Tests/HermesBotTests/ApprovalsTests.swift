@@ -363,10 +363,7 @@ struct ApprovalsTests {
 
         // Host SettingsView while the roster is still loading.
         _ = NSApplication.shared
-        let window = NSWindow(
-            contentRect: NSRect(x: -10000, y: -10000, width: 520, height: 640),
-            styleMask: [.borderless], backing: .buffered, defer: false
-        )
+        let window = OnScreenTesting.panel(in: NSRect(x: -10000, y: -10000, width: 520, height: 640))
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: SettingsView(roster: roster, close: {}))
         window.orderBack(nil)
@@ -529,10 +526,7 @@ struct ApprovalsTests {
         #expect(first.approvals == .every(.manual))
 
         _ = NSApplication.shared
-        let window = NSWindow(
-            contentRect: NSRect(x: -10000, y: -10000, width: 520, height: 640),
-            styleMask: [.borderless], backing: .buffered, defer: false
-        )
+        let window = OnScreenTesting.panel(in: NSRect(x: -10000, y: -10000, width: 520, height: 640))
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: SettingsView(roster: first, close: {}))
         window.orderBack(nil)
@@ -776,7 +770,7 @@ struct ApprovalsTests {
         try await until("the hold to lift", within: 5) { !roster.chat(for: made).approvalsHeld }
     }
 
-    /// Owner's ask on PR 60: Hermes starts a new bot at its default mode, so a bot made here
+    /// Hermes starts a new bot at its default mode, so a bot made here
     /// is given the mode every bot was shown to have, and every bot has it again.
     @Test func aBotMadeHereIsGivenTheModeEveryBotHas() async throws {
         let pretend = try await Pretend()

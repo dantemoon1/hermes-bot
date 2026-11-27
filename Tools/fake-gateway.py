@@ -6,6 +6,8 @@
     python3 Tools/fake-gateway.py 9120 authority # chats go through the session authority
     python3 Tools/fake-gateway.py 9120 no-rewind # no undo and no reactions, as an older gateway
     python3 Tools/fake-gateway.py 9120 unsaved   # a description or soul is answered as not saved
+    python3 Tools/fake-gateway.py 9149 long      # the main bot's chat holds 500 mixed messages, and
+                                                 # "long" in a message gets a long reply streamed fast
     (in any mode, a message saying "ask me approve", "ask me clarify secret", … gets questions: see REQUESTS)
     HERMES_URL=127.0.0.1:9119 HERMES_TOKEN=demo swift run HermesBot
 
@@ -111,6 +113,52 @@ CHATS = {
 
 # The bot reacted to "thanks", as a bot given Hermes's reaction tool can.
 CHATS["chat-main"][7]["display_metadata"] = {"reactions": [{"emoji": "👍", "author": "agent", "at": NOW}]}
+
+
+# "long" mode: a chat of 500 messages, as a bot used daily for months has, to measure the app on.
+LONG_TOPICS = ("the garden beds", "the Lisbon trip", "the bakery order", "the reading list", "the budget",
+               "the kitchen shelves", "the bike repair", "the weekly shop", "the photo backup", "the move")
+
+
+def long_reply(n, topic):
+    """A made-up reply of a few kinds in turn: paragraphs, a list, code, a table, a page."""
+    para = ("Here is where %s stands. The first part is done and the rest waits on one answer from you; "
+            "nothing is urgent, but the sooner it is settled the less there is to redo later. ") % topic
+    kind = n % 6
+    if kind == 0:
+        return (para * 3) + "\n\n" + ("I also looked at what changed since last week. " * 6) + "\n\nWant me to carry on?"
+    if kind == 1:
+        items = "\n".join("%d. Step %d for %s, with a **note** about timing and `a detail`" % (i, i, topic) for i in range(1, 7))
+        return "## Plan for %s\n\n%s\n\n- one more thing\n  - nested under it\n  - and another\n\n%s" % (topic, items, para)
+    if kind == 2:
+        code = "\n".join("item_%d = plan(%r, step=%d)  # keeps the order" % (i, topic, i) for i in range(12))
+        return "This should do it:\n\n```python\n%s\n```\n\n%s" % (code, para)
+    if kind == 3:
+        rows = "\n".join("| %s %d | %d | %s |" % (topic.split()[-1], i, i * 7, "ok" if i % 2 else "later") for i in range(1, 6))
+        return "### Where things are\n\n| What | Cost | When |\n|---|---|---|\n%s\n\n> Prices are from last Tuesday.\n\n%s" % (rows, para)
+    if kind == 4 and n % 60 == 4:
+        return "Here is the chart again.\n\n::preview{file=\"/demo/yield.html\"}\n\n" + para
+    return para + "\n\n" + "That is all for now."
+
+
+def long_chat(count=500):
+    rows, stamp = [], NOW - count * 1800
+    for n in range(count // 2):
+        topic = LONG_TOPICS[n % len(LONG_TOPICS)]
+        stamp += 1700
+        rows.append(("user", 0, "can you look at %s again (%d)" % (topic, n), None))
+        rows.append(("assistant", 60, long_reply(n, topic), ["notes", "calendar"] if n % 5 == 0 else None))
+    out, at = [], NOW - count * 1800
+    for index, (role, gap, content, tools) in enumerate(rows):
+        at += 1800 if role == "user" else gap
+        row = {"id": index + 1, "role": role, "content": content, "timestamp": at}
+        if tools:
+            row["tool_calls"] = [{"function": {"name": name, "arguments": "{}"}} for name in tools]
+        out.append(row)
+    return out
+
+
+LONG_REPLY = "\n\n".join(long_reply(n, LONG_TOPICS[n % len(LONG_TOPICS)]) for n in range(1, 25) if n % 6 != 4)
 
 
 def is_persons(row):
@@ -608,7 +656,17 @@ class Handler(socketserver.StreamRequestHandler):
         """What an authorised HTTP read gets."""
         parts = [unquote(part) for part in url.path.strip("/").split("/")]
         if len(parts) == 4 and parts[:2] == ["api", "sessions"] and parts[3] == "messages" and parts[2] in CHATS:
-            return self.reply(200, {"session_id": parts[2], "messages": CHATS[parts[2]]})
+            # Paged as Hermes pages it: "latest" counts back from the newest, offset first,
+            # and gives the page oldest first.
+            asked = parse_qs(url.query)
+            rows = CHATS[parts[2]]
+            limit = min(int(asked.get("limit", ["500"])[0]), 500)
+            offset = int(asked.get("offset", ["0"])[0])
+            if asked.get("order", ["latest"])[0] == "latest":
+                rows = rows[::-1][offset:][:limit][::-1]
+            else:
+                rows = rows[offset:][:limit]
+            return self.reply(200, {"session_id": parts[2], "messages": rows})
         if url.path == "/api/fs/download":
             # Files a bot hands over with MEDIA:, made up here. Asked for by bot, and by
             # chat when one is named, as the real route is.
@@ -1307,6 +1365,10 @@ class Handler(socketserver.StreamRequestHandler):
         rows = CHATS[chat_id]
         slow = "slow" in text.lower()
         reply = "Still thinking about that one. " * 12 if slow else f"You said “{text}”. I'm a pretend bot, so that's all I have, but **everything arrived**."
+        # "long": a long reply, a few words at a time and quickly, as a real model streams.
+        fast = BUSY_MODE == "long" and "long" in text.lower()
+        if fast:
+            reply = LONG_REPLY
         # Asked in words to change its page: the bot writes the same file again and shows it
         # again in its reply, as a real bot does.
         if not hidden and chat_id == "chat-garden" and "hand me the page file" in text.lower():
@@ -1341,9 +1403,12 @@ class Handler(socketserver.StreamRequestHandler):
             heard = self.ask_questions(chat_id, lowered, emit, stopped)
             reply = "Asked, and heard: " + "; ".join(heard) + "."
         words = reply.split(" ")
+        if fast:
+            # Two or three words to a delta, as tokens come, with their spaces and line breaks.
+            words = [" ".join(words[i:i + 3]) for i in range(0, len(words), 3)]
         turned = None
         while words:
-            if stopped.wait(0.25 if slow else 0.06):
+            if stopped.wait(0.25 if slow else 0.015 if fast else 0.06):
                 break
             with TURNING:
                 turned = TURNED[chat_id].pop(0) if TURNED.get(chat_id) else None
@@ -1835,6 +1900,9 @@ if __name__ == "__main__":
         VERSION = "v2026.9.21"
     if BUSY_MODE == "approvals-mixed":
         APPROVAL_MODES["garden"] = "smart"
+    if BUSY_MODE == "long":
+        CHATS["chat-main"] = long_chat()
+        changed("chat-main")
     REDIRECT_TO = int(sys.argv[3]) if len(sys.argv) > 3 else 0
     if BUSY_MODE.endswith("+late-ready"):
         BUSY_MODE, LATE_READY = BUSY_MODE[:-len("+late-ready")], 0.3

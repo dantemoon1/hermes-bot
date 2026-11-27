@@ -1691,10 +1691,10 @@ final class RosterModel {
     }
 
     /// The latest messages of a bot's chat. A bot that has never chatted has none.
-    func messages(for bot: Bot) async throws -> [ChatMessage] {
+    func messages(for bot: Bot, limit: Int = GatewayClient.chatReadLimit) async throws -> [ChatMessage] {
         guard let chat = bot.chat else { return [] }
         guard let client else { throw GatewayError.notConnected }
-        return try await client.chatMessages(sessionID: chat.id, profile: bot.name)
+        return try await client.chatMessages(sessionID: chat.id, profile: bot.name, limit: limit)
     }
 
     /// Files bots have handed over, kept while the gateway is the one in use so that a
@@ -2302,7 +2302,7 @@ final class RosterModel {
         defer { isMakingBot = false }
         let thisLoad = loadCount
         // Hermes starts a new bot at its default mode, not the one every bot was last confirmed
-        // to have here: that one is written to it too, once it is made (owner's ask, PR 60).
+        // to have here: that one is written to it too, once it is made.
         let carry = approvalsLastEvery.map { (mode: $0, changes: approvalsChangesAsked, chats: approvalsChatChanges) }
         let client: GatewayClient
         do {
