@@ -29,10 +29,10 @@ struct PageSendTests {
     /// The chat on screen, as it is in the app, and the pages in it.
     @MainActor
     private final class OnScreen {
-        let window: NSWindow
+        let window: NSPanel
 
         @MainActor init(_ bot: Bot, _ roster: RosterModel, height: CGFloat = 700) {
-            window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: height), styleMask: [.borderless], backing: .buffered, defer: false)
+            window = OnScreenTesting.panel(width: 640, height: height)
             window.contentView = NSHostingView(rootView: ChatView(bot: bot, roster: roster, reactionPicker: .constant(nil)).frame(width: 640, height: height))
             window.orderFrontRegardless()
         }
@@ -104,7 +104,8 @@ struct PageSendTests {
     /// Sent from a page: no bubble, the composer and what is in it left alone, the line
     /// shows the words at once and Updated once the page has been read again past what was
     /// kept of it; and after the chat is opened again, the line is still there.
-    @Test func aPagesMessageGoesHiddenAndThePageIsReadAgain() async throws {
+    @Test(.tags(.onScreen), .enabled(if: OnScreenTesting.enabled, OnScreenTesting.whySkipped))
+    func aPagesMessageGoesHiddenAndThePageIsReadAgain() async throws {
         let pretend = try await SendingTests.Pretend()
         let (roster, bot, chat, key) = try await open(pretend)
         let before = try #require(String(data: try await roster.file(at: Self.page, from: bot).data, encoding: .utf8))
@@ -244,15 +245,16 @@ struct PageSendTests {
 
     /// A page whose line would be out of sight, or covered, or in a window not showing,
     /// cannot send: nothing goes unseen.
-    @Test func aPageCanSendOnlyWithItsLineInSight() async throws {
+    @Test(.tags(.onScreen), .enabled(if: OnScreenTesting.enabled, OnScreenTesting.whySkipped))
+    func aPageCanSendOnlyWithItsLineInSight() async throws {
         let inFront = PageFrame.Keeper.inFront
         PageFrame.Keeper.inFront = { $0.isVisible }
         defer { PageFrame.Keeper.inFront = inFront }
         let pretend = try await SendingTests.Pretend()
         let (roster, bot, chat, key) = try await open(pretend)
         /// The page in a window of `height`, in a chat whose clear part is `clear` of it.
-        func show(height: CGFloat, clear: CGFloat) -> NSWindow {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: height), styleMask: [.borderless], backing: .buffered, defer: false)
+        func show(height: CGFloat, clear: CGFloat) -> NSPanel {
+            let window = OnScreenTesting.panel(width: 560, height: height)
             window.contentView = NSHostingView(rootView: GeometryReader { _ in
                 ScrollView {
                     VStack {
@@ -268,7 +270,7 @@ struct PageSendTests {
             return window
         }
         func pages(_ view: NSView) -> [PageView] { (view as? PageView).map { [$0] } ?? view.subviews.flatMap(pages) }
-        func send(_ words: String, in window: NSWindow) async throws -> String {
+        func send(_ words: String, in window: NSPanel) async throws -> String {
             var page: PageView?
             for _ in 0..<200 {
                 if let found = pages(window.contentView!).first,
@@ -311,7 +313,8 @@ struct PageSendTests {
 
     /// While a page's message is on its way, no page can move its line out of sight by
     /// changing its height; the height it asked for is given once the message has gone.
-    @Test func pagesKeepTheirHeightWhileAMessageIsOnItsWay() async throws {
+    @Test(.tags(.onScreen), .enabled(if: OnScreenTesting.enabled, OnScreenTesting.whySkipped))
+    func pagesKeepTheirHeightWhileAMessageIsOnItsWay() async throws {
         let pretend = try await SendingTests.Pretend()
         let (roster, bot, chat, key) = try await open(pretend)
         let screen = OnScreen(bot, roster)
@@ -344,7 +347,8 @@ struct PageSendTests {
     /// The bot may write again only a file beside the page: read again after the exchange,
     /// and when the page is shown afresh (as after picking another bot and coming back),
     /// the page runs the new one, not what was kept of the old.
-    @Test func aScriptBesideThePageWrittenAgainIsRunAfterwards() async throws {
+    @Test(.tags(.onScreen), .enabled(if: OnScreenTesting.enabled, OnScreenTesting.whySkipped))
+    func aScriptBesideThePageWrittenAgainIsRunAfterwards() async throws {
         let pretend = try await SendingTests.Pretend()
         let (roster, bot, chat, _) = try await open(pretend)
         let reply = try #require(chat.items.first { if case .bot(_, let text) = $0 { text.contains("water.html") } else { false } })
@@ -378,7 +382,8 @@ struct PageSendTests {
     /// Asked in an ordinary message, the bot writes a page's file again and shows it again in
     /// its reply: the new reply's page and the older one both show the file as it is now,
     /// without starting the app again.
-    @Test func aPageWrittenAgainInAnOrdinaryReplyIsShownFresh() async throws {
+    @Test(.tags(.onScreen), .enabled(if: OnScreenTesting.enabled, OnScreenTesting.whySkipped))
+    func aPageWrittenAgainInAnOrdinaryReplyIsShownFresh() async throws {
         let pretend = try await SendingTests.Pretend()
         let (roster, bot, chat, _) = try await open(pretend)
         let screen = OnScreen(bot, roster, height: 1800)
@@ -405,7 +410,8 @@ struct PageSendTests {
 
     /// A newer reply that names the page's file only as a file handed over (`MEDIA:`) still
     /// has the page showing it read it again.
-    @Test func aPageWhoseFileANewReplyHandsOverIsShownFresh() async throws {
+    @Test(.tags(.onScreen), .enabled(if: OnScreenTesting.enabled, OnScreenTesting.whySkipped))
+    func aPageWhoseFileANewReplyHandsOverIsShownFresh() async throws {
         let pretend = try await SendingTests.Pretend()
         let (roster, bot, chat, _) = try await open(pretend)
         let screen = OnScreen(bot, roster, height: 1800)
@@ -438,7 +444,8 @@ struct PageSendTests {
 
     /// The page in the chat, sent from by a real click, is shown again once the bot has
     /// written it again, with the line under it.
-    @Test func thePageIsShownAgainWhenItsFileChanges() async throws {
+    @Test(.tags(.onScreen), .enabled(if: OnScreenTesting.enabled, OnScreenTesting.whySkipped))
+    func thePageIsShownAgainWhenItsFileChanges() async throws {
         let pretend = try await SendingTests.Pretend()
         let (roster, bot, chat, _) = try await open(pretend)
         let inFront = PageFrame.Keeper.inFront

@@ -303,7 +303,25 @@ final class ChatModel {
     private var sent: (text: String, date: Date, hidden: Bool)?
     /// Parts of the answer that are messages a page added to it, not shown as the person's.
     private var hiddenParts: Set<Int> = []
-    private var turn: LiveTurn?
+    /// The answer as the chat shows it. Words arriving faster than the screen can usefully
+    /// follow are gathered and shown at most `streamInterval` apart; `turn` is always the
+    /// latest, for everything but drawing.
+    private var shownTurn: LiveTurn?
+    @ObservationIgnored private var pendingTurn: LiveTurn?
+    @ObservationIgnored private var pendingShow: Task<Void, Never>?
+    @ObservationIgnored private var lastShown = ContinuousClock.now
+    static let streamInterval = Duration.milliseconds(33)
+    private var turn: LiveTurn? {
+        // What is shown is read first, so a view reading this follows it even while newer
+        // words wait to be shown.
+        get { let shown = shownTurn; return pendingTurn ?? shown }
+        set {
+            pendingTurn = nil
+            pendingShow?.cancel()
+            pendingShow = nil
+            shownTurn = newValue
+        }
+    }
     private var stage = Stage.opening
     private var sending: Task<Void, Never>?
     private var stopRequested = false
@@ -363,12 +381,12 @@ final class ChatModel {
         if let askingAgain, let place = stored.firstIndex(where: { $0.id == TranscriptItem.user(id: askingAgain, text: "").id }) {
             // The message asked again stands where it stood, under the same time stamp.
             items = Array(stored[..<place])
-        } else if lastStoredDate.map({ sent.date.timeIntervalSince($0) >= 3600 }) ?? true, !sent.hidden || turn?.parts.contains(where: { !hiddenParts.contains($0.id) }) == true {
+        } else if lastStoredDate.map({ sent.date.timeIntervalSince($0) >= 3600 }) ?? true, !sent.hidden || shownTurn?.parts.contains(where: { !hiddenParts.contains($0.id) }) == true {
             // A page's message shows nothing of its own: the time goes over what the bot says.
             items.append(.date(sent.date))
         }
         if !sent.hidden { items.append(.user(id: sentID, text: sent.text)) }
-        for part in turn?.parts ?? [] {
+        for part in shownTurn?.parts ?? [] {
             switch part.content {
             case .said(let text): items.append(.bot(id: partID(part), text: text))
             case .used(let tools): items.append(.activity(id: partID(part), tools: tools))
@@ -451,7 +469,38 @@ final class ChatModel {
     private var settling: [TranscriptItem.ID: Task<Void, Never>] = [:]
 
     private func publish(_ answer: LiveTurn) {
-        let before = turn
+        // Only more words for what the bot is saying: gathered, and shown with the next lot,
+        // so a fast reply is laid out a few dozen times a second, not once for every word.
+        if let before = turn, Self.onlyWordsAdded(from: before, to: answer) {
+            let wait = Self.streamInterval - (ContinuousClock.now - lastShown)
+            if wait > .zero {
+                pendingTurn = answer
+                if pendingShow == nil {
+                    pendingShow = Task { [weak self] in
+                        try? await Task.sleep(for: wait)
+                        guard !Task.isCancelled, let self, let pending = self.pendingTurn else { return }
+                        self.display(pending)
+                    }
+                }
+                return
+            }
+        }
+        display(answer)
+    }
+
+    /// The answer differs from the one before only by more words at the end of the last
+    /// thing the bot is saying.
+    static func onlyWordsAdded(from before: LiveTurn, to after: LiveTurn) -> Bool {
+        guard before.parts.count == after.parts.count, let was = before.parts.last, let now = after.parts.last,
+              was.id == now.id, before.outcome == after.outcome, before.hasStarted == after.hasStarted,
+              case .said(let old) = was.content, case .said(let new) = now.content,
+              new.count > old.count, new.hasPrefix(old) else { return false }
+        return before.parts.dropLast() == after.parts.dropLast()
+    }
+
+    private func display(_ answer: LiveTurn) {
+        lastShown = .now
+        let before = shownTurn
         turn = answer
         if let sent { liveDates[TranscriptItem.user(id: sentID, text: "").id] = liveDates[TranscriptItem.user(id: sentID, text: "").id] ?? sent.date }
         for part in answer.parts {
@@ -488,39 +537,123 @@ final class ChatModel {
         }
     }
 
+    /// How many of the chat's latest stored rows are read and shown: a page when the chat is
+    /// opened, and a page more each time the person scrolls to the top of what is shown, so a
+    /// long chat costs no more to draw than a short one until it is read back.
+    static let pageSize = 50
+    /// Hermes gives at most this many rows in one read.
+    static let mostShown = 500
+    private(set) var window = ChatModel.pageSize
+    /// The chat goes back further than what is shown, and more can be read in.
+    private(set) var hasOlder = false
+    private(set) var isLoadingOlder = false
+
+    /// Older rows can be read in just now. Not while an answer is shown live: reading the
+    /// stored chat would put it in the answer's place.
+    var canLoadOlder: Bool { hasOlder && !isLoadingOlder && !isWorking && phase == .loaded }
+
+    /// Goes up each time a page of older rows has been shown, in the same moment as the rows:
+    /// the view keeps its place by it as they are laid out.
+    private(set) var olderShown = 0
+    /// How many rows the chat was last shown for.
+    @ObservationIgnored private var windowShown = ChatModel.pageSize
+
+    /// Another read of the chat was asked for while a page of older rows was being read, for
+    /// the bot as it then was: it is made once that read is done, so nothing overtakes it.
+    @ObservationIgnored private var readAfterOlder: Bot?
+
+    /// Reads a page more of the chat's history, above what is shown. True when it is shown.
+    /// The window stays as it was if it is not (the read failed, or a message sent meanwhile
+    /// set it aside).
+    @discardableResult
+    func loadOlder(_ bot: Bot, from roster: RosterModel) async -> Bool {
+        guard canLoadOlder else { return false }
+        isLoadingOlder = true
+        let was = window, olderBefore = olderShown
+        window = min(window + Self.pageSize, Self.mostShown)
+        await read(bot, from: roster)
+        let shown = olderShown != olderBefore
+        if !shown, window > was { window = was }
+        isLoadingOlder = false
+        // What was asked for meanwhile (the chat moved on elsewhere), now, for the bot as it
+        // was last asked for, with the window as it stands. Any read asked for from here goes
+        // straight ahead.
+        if let waiting = readAfterOlder {
+            readAfterOlder = nil
+            await read(waiting, from: roster)
+        }
+        return shown
+    }
+
+    /// The chat is being opened: it shows its latest page again, however far back it was read.
+    func showLatest() {
+        window = Self.pageSize
+    }
+
     /// Reads the stored chat. The first time it shows a spinner; after that the chat stays
-    /// on screen while it is read again.
+    /// on screen while it is read again. While a page of older rows is being read, this read
+    /// is made after it.
     func load(_ bot: Bot, from roster: RosterModel) async {
+        if isLoadingOlder {
+            readAfterOlder = bot
+            return
+        }
+        await read(bot, from: roster)
+    }
+
+    /// True when what was read is shown.
+    @discardableResult
+    private func read(_ bot: Bot, from roster: RosterModel) async -> Bool {
         // Mid-answer the stored chat is behind what is on screen; it is read when the answer ends.
-        guard !isWorking, !isAbandoned else { return }
+        guard !isWorking, !isAbandoned else { return false }
         loadCount += 1
         let thisLoad = loadCount
         if phase != .loaded { phase = .loading }
         let clock = reactionClock
+        let asked = window
         do {
-            let messages = try await roster.messages(for: bot)
-            guard thisLoad == loadCount, !Task.isCancelled, !isAbandoned else { return }
-            freshen(show(messages, readFrom: clock), of: bot, through: roster)
+            let messages = try await roster.messages(for: bot, limit: asked)
+            guard thisLoad == loadCount, !Task.isCancelled, !isAbandoned else { return false }
+            freshen(show(messages, asked: asked, readFrom: clock), of: bot, through: roster)
             // On screen as far as this copy of the bot knew: the roster may count it read.
             roster.didShow(bot)
+            return true
         } catch {
             // A load that was cancelled or overtaken has nothing to report. Nor does a
             // failed re-read: the chat already on screen is better than an error.
-            guard thisLoad == loadCount, !Task.isCancelled, !(error is CancellationError), phase != .loaded else { return }
+            guard thisLoad == loadCount, !Task.isCancelled, !(error is CancellationError), phase != .loaded else { return false }
             let text = roster.text(for: error)
             if case GatewayError.unsupported = error { phase = .unavailable(text) } else { phase = .failed(text) }
+            return false
         }
     }
 
     /// Shows the stored chat, and says which files the bot's replies new since it was last
     /// shown name (pages and files handed over): the bot may have written any of them again.
     @discardableResult
-    private func show(_ messages: [ChatMessage], readFrom clock: Int? = nil) -> (pages: Set<String>, files: Set<String>) {
+    private func show(_ read: [ChatMessage], asked: Int, readFrom clock: Int? = nil) -> (pages: Set<String>, files: Set<String>) {
+        // Read for a larger window than there is now (the chat was opened again meanwhile):
+        // only the window's worth is shown.
+        let messages = read.count > window ? Array(read.suffix(window)) : read
+        let asked = min(asked, window)
+        // A read that came back full may have left older rows behind.
+        hasOlder = messages.count >= asked && asked < Self.mostShown
+        if asked > windowShown { olderShown += 1 }
+        windowShown = asked
         // The stored chat is in full colour; nothing waits to turn.
         for wait in settling.values { wait.cancel() }
         settling = [:]
         let shownBefore = phase == .loaded ? Set(stored.compactMap { if case .bot(let id, _) = $0, id >= 0 { id } else { nil } }) : nil
         let dated = Transcript.dated(from: messages)
+        // What each row said when last shown, so a row that has not changed keeps its
+        // formatting rather than being read again: the chat is read again after every turn.
+        let saidBefore = Dictionary(stored.compactMap { item -> (TranscriptItem.ID, String)? in
+            switch item {
+            case .bot(_, let text), .user(_, let text): (item.id, text)
+            default: nil
+            }
+        }, uniquingKeysWith: { first, _ in first })
+        let styledBefore = styled
         stored = dated.map(\.item)
         storedDates = Dictionary(dated.compactMap { row in row.date.map { (row.item.id, $0) } }, uniquingKeysWith: { first, _ in first })
         liveDates = [:]
@@ -541,7 +674,7 @@ final class ChatModel {
         askingAgain = nil
         // Only a read that holds the whole chat, or reaches back as far as the row, can say
         // whether it is gone; one that cannot leaves the question for a later read.
-        if let (row, words) = wordsIfGone, messages.count < GatewayClient.chatReadLimit || messages.first.map({ $0.id <= row }) ?? true {
+        if let (row, words) = wordsIfGone, messages.count < asked || messages.first.map({ $0.id <= row }) ?? true {
             wordsIfGone = nil
             // Gone, and not asked again since: a newer row of the person's with the same words.
             let askedAgain = messages.contains { $0.isPersons && $0.id > row && SentParts(stored: $0.text).words == words }
@@ -552,12 +685,15 @@ final class ChatModel {
         }
         styled = Dictionary(stored.compactMap { item in
             switch item {
-            case .bot(_, let text): (item.id, Self.style(reply: text))
-            case .user(let id, let text): (item.id, Self.style(id < 0 ? text : parts(of: text).words))
-            default: nil
+            case .bot(_, let text), .user(_, let text):
+                if saidBefore[item.id] == text, let kept = styledBefore[item.id], kept.last?.isGreyed != true { return (item.id, kept) }
+                if case .user(let id, _) = item { return (item.id, Self.style(id < 0 ? text : parts(of: text).words)) }
+                return (item.id, Self.style(reply: text))
+            default: return nil
             }
         }, uniquingKeysWith: { first, _ in first })
         linesRead = Self.pageLines(in: messages, styled: styled)
+        let newestBefore = lastRow
         lastRow = messages.map(\.id).max() ?? lastRow
         // A page whose reply was shown only as it arrived now stands under its stored id:
         // what was sent from it is in the stored chat.
@@ -581,7 +717,8 @@ final class ChatModel {
         guard let shownBefore else { return ([], []) }
         var named: (pages: Set<String>, files: Set<String>) = ([], [])
         for item in stored {
-            guard case .bot(let id, _) = item, !shownBefore.contains(id) else { continue }
+            // Older rows read in above are not new: only those after the newest seen before.
+            guard case .bot(let id, _) = item, !shownBefore.contains(id), id > newestBefore else { continue }
             for block in styled[item.id] ?? [] {
                 switch block.kind {
                 case .page: named.pages.insert(block.raw)
@@ -1595,6 +1732,9 @@ final class ChatModel {
         stopping open: (chat: LiveChat, client: GatewayClient)? = nil
     ) {
         stage = .settling
+        // Words gathered and not yet shown are shown: what arrived stays on screen if the
+        // chat is not read again.
+        if let pending = pendingTurn { display(pending) }
         guard !isAbandoned else {
             sending = nil
             return
@@ -1618,9 +1758,10 @@ final class ChatModel {
                 // read: what is on screen stays, rather than being taken for an empty chat.
                 var shown: Bot?
                 let clock = reactionClock
+                let asked = window
                 if !isAbandoned, let now = roster.bots.first(where: { $0.id == bot.id }), now.chat != nil || bot.chat != nil,
-                   let messages = try? await roster.messages(for: now), !isAbandoned {
-                    freshen(show(messages, readFrom: clock), of: now, through: roster)
+                   let messages = try? await roster.messages(for: now, limit: asked), !isAbandoned {
+                    freshen(show(messages, asked: asked, readFrom: clock), of: now, through: roster)
                     shown = now
                 }
                 sending = nil
@@ -1862,6 +2003,29 @@ struct ChatView: View {
     @State private var currentFind: ChatFind.Match?
     /// Counts goings to a find, each of which brings it into sight.
     @State private var findJumps = 0
+    /// How near the top of what is shown the chat is scrolled, and whether it has been at its
+    /// end since it opened.
+    private enum Top { case far, near, fits }
+    private struct Place: Equatable {
+        let top: Top
+        let atEnd: Bool
+        let offset: CGFloat
+        let height: CGFloat
+    }
+    /// Where the chat was last scrolled, and how far from its end to keep it while older rows
+    /// are read in above. Not state: it changes with every step of a scroll, and nothing is
+    /// drawn from it.
+    private final class ScrollMemo {
+        var last: Place?
+        /// Older rows are on their way (`ChatModel.olderShown` as it was when asked for): when
+        /// they come, what was in sight is kept in place.
+        var pagingFrom: Int?
+        var reads = 0
+    }
+    @State private var scrollMemo = ScrollMemo()
+    @State private var top = Top.far
+    /// The bot whose chat has been at its end since it was opened.
+    @State private var landedIn: Bot.ID?
     /// How wide the bot's name floating over the chat is, so the find pill keeps clear of it.
     @Environment(\.pillWidth) private var pillWidth
     /// A panel is open over the window: cards behind it take no keys or clicks.
@@ -1895,15 +2059,18 @@ struct ChatView: View {
                 let gone = chat.notes.filter { $0.after.map { !shownIDs.contains($0) } ?? false }
                 ScrollViewReader { scroller in
                 ScrollView {
-                    // Not lazy: a page is at most a hundred rows, and a lazy stack anchored to the
-                    // bottom can come up blank.
+                    // Not lazy: what is shown is a page or a few of the chat's latest rows
+                    // (`ChatModel.window`), and a lazy stack anchored to the bottom can come up blank.
                     VStack(spacing: 14) {
                         let lines = chat.settledQuestions
                         ForEach(lines[nil] ?? []) { QuestionLine(asked: $0) }
                         // Made while the chat was empty: before everything said since.
                         ForEach(chat.notes.filter { $0.after == nil }) { note(chat, $0) }
                         ForEach(items) { item in
-                            row(item, chat, theme)
+                            MessageRow(item: item, look: look(of: item, in: chat), bot: bot, roster: roster, chat: chat, reactionPicker: $reactionPicker)
+                                .equatable()
+                                // Said outright, as for a part of a reply (`ReplyPart`).
+                                .alignmentGuide(HorizontalAlignment.center) { $0.width / 2 }
                                 .id(item.id)
                             ForEach(lines[item.id] ?? []) { QuestionLine(asked: $0) }
                             ForEach(placed[item.id] ?? []) { note(chat, $0) }
@@ -1938,8 +2105,62 @@ struct ChatView: View {
                     // long one opens on its newest message.
                     .frame(maxWidth: .infinity, minHeight: pane.size.height, alignment: .top)
                 }
+                // Anchored to the end for size changes too, so rows read in above leave what is
+                // in sight where it was.
                 .defaultScrollAnchor(.bottom)
                 .scrollPosition($position)
+                // Near the top of what is shown, however it got there (a wheel, the keys, the
+                // scroll bar), once it has landed on its end (a scroll view that has just opened
+                // can say it is at the top before it gets there), or when it all fits: a page
+                // more of the chat's history is read in.
+                .onScrollGeometryChange(for: Place.self) { geometry in
+                    Place(
+                        top: geometry.contentSize.height <= geometry.containerSize.height ? .fits : geometry.contentOffset.y < 600 ? .near : .far,
+                        atEnd: geometry.contentOffset.y + geometry.containerSize.height >= geometry.contentSize.height - 2,
+                        offset: geometry.contentOffset.y, height: geometry.contentSize.height
+                    )
+                } action: { before, place in
+                    scrollMemo.last = place
+                    if place.atEnd, landedIn != bot.id { landedIn = bot.id }
+                    // Rows read in above leave what was in sight where it was: as far from the
+                    // end as it was the moment before they came (not when they were asked for,
+                    // since the person may have scrolled meanwhile). Once, for those rows, and
+                    // only once they have been shown: nothing else that grows before takes it.
+                    if let from = scrollMemo.pagingFrom, chat.olderShown > from, place.height > before.height {
+                        scrollMemo.pagingFrom = nil
+                        position.scrollTo(y: max(0, place.height - (before.height - before.offset)))
+                        // Where this pass says the chat is comes before that: not near the top.
+                        return
+                    }
+                    // Not while older rows are on their way: the rows coming put the chat
+                    // elsewhere, and saying now that it is near the top would read on at once.
+                    if scrollMemo.pagingFrom == nil, top != place.top { top = place.top }
+                }
+                .onChange(of: chat.canLoadOlder && (top == .fits || top == .near && landedIn == bot.id), initial: true) { _, wants in
+                    guard wants else { return }
+                    // Away from the top until the chat says otherwise: the rows coming put it
+                    // there, and what it last said is from before they came.
+                    top = .far
+                    scrollMemo.pagingFrom = chat.olderShown
+                    scrollMemo.reads += 1
+                    let read = scrollMemo.reads
+                    Task {
+                        let shown = await chat.loadOlder(bot, from: roster)
+                        // What came is in place: where the chat now is says whether to read on
+                        // (a page that added nothing in sight changes nothing the chat would say
+                        // by itself). One that did not come is not asked for again until the
+                        // chat is scrolled: the gateway may be away.
+                        try? await Task.sleep(for: .milliseconds(400))
+                        guard scrollMemo.reads == read else { return }
+                        scrollMemo.pagingFrom = nil
+                        if shown, let last = scrollMemo.last, top != last.top { top = last.top }
+                    }
+                }
+
+                // Anything else that moves the chat comes before keeping its place.
+                .onChange(of: chat.scrollCount) { scrollMemo.pagingFrom = nil }
+                .onChange(of: findJumps) { scrollMemo.pagingFrom = nil }
+                .onChange(of: chat.questions.open.map(\.id)) { scrollMemo.pagingFrom = nil }
                 // Where nothing floats over the chat: below the fade under the bot's name and
                 // above the message box. A page's line must be there for the page to send.
                 // The field for finding, while it is open, can reach below the fade.
@@ -1961,6 +2182,16 @@ struct ChatView: View {
                     .frame(height: Self.fade)
                     .padding(.trailing, Self.scrollBarWidth)
                     .allowsHitTesting(false)
+                }
+                // Older rows being read in above: over the fade, just under the bot's name
+                // (which floats 10 to 48 down), so it is seen wherever the chat is scrolled.
+                .overlay(alignment: .top) {
+                    if chat.isLoadingOlder {
+                        ProgressView().controlSize(.small)
+                            .padding(.top, 58)
+                            .padding(.trailing, Self.scrollBarWidth)
+                            .allowsHitTesting(false)
+                    }
                 }
                 // The find gone to is brought into sight; one that has gone from the chat
                 // gives way to the newest that is left.
@@ -2067,7 +2298,11 @@ struct ChatView: View {
             return true
         }
         .coordinateSpace(name: Self.pane)
-        .task(id: LoadKey(bot: bot.id, attempt: attempt)) { await chat.load(bot, from: roster) }
+        .task(id: LoadKey(bot: bot.id, attempt: attempt)) {
+            // Opened at its latest page, however far back it was read last time.
+            chat.showLatest()
+            await chat.load(bot, from: roster)
+        }
         // While clarifying questions are open the message box is their answer; what was
         // being typed is put aside until they go.
         .onChange(of: chat.questions.clarifying?.instance, initial: true) { _, now in chat.clarifyingChanged(to: now) }
@@ -2126,6 +2361,37 @@ struct ChatView: View {
         return chat.styled[item.id] ?? [StyledBlock(id: 0, kind: .paragraph, raw: text, text: AttributedString(text))]
     }
 
+    /// What a row shows, read from the chat here so the row itself reads nothing of it.
+    private func look(of item: TranscriptItem, in chat: ChatModel) -> RowLook {
+        var look = RowLook(zoom: TextZoom.clamped(zoom))
+        switch item {
+        case .date, .activity:
+            return look
+        case .bot(let id, let text):
+            look.reactions = chat.reactions[id] ?? []
+            look.canReact = chat.canReact(id)
+            look.canRetry = chat.canRetry(id)
+            // A reply still arriving has an id below nothing; stored, it has its own. One
+            // that arrived whole and could not then be read back stored can change no more
+            // either: nothing is at work in the chat.
+            look.isSettled = id >= 0 || !chat.isWorking
+            look.blocks = shownMarked(item, text, in: chat)
+        case .user(let id, let text):
+            look.reactions = chat.reactions[id] ?? []
+            look.canUndo = chat.canUndo(id)
+            if id >= 0 { look.parts = chat.parts(of: text) }
+            if id == chat.sentAttachmentsRow { look.onItsWay = chat.sentAttachments }
+            look.blocks = shownMarked(item, id < 0 ? text : look.parts.words, in: chat)
+        }
+        return look
+    }
+
+    /// A message's blocks as its bubble shows them, with what is found marked.
+    private func shownMarked(_ item: TranscriptItem, _ text: String, in chat: ChatModel) -> [StyledBlock] {
+        let shown = chat.styled[item.id] ?? [StyledBlock(id: 0, kind: .paragraph, raw: text, text: AttributedString(text))]
+        return isFinding ? ChatFind.marked(shown, in: item.id, query: findQuery, current: currentFind, theme: Theme(scheme)) : shown
+    }
+
     /// The chat's own space, in which a page's line is measured against `chatClear`.
     static let pane = "chat pane"
     /// How tall the fade under the bot's name is.
@@ -2140,124 +2406,6 @@ struct ChatView: View {
             .foregroundStyle(theme.secondaryText)
             .multilineTextAlignment(.center)
             .frame(maxWidth: 320)
-    }
-
-    @ViewBuilder
-    private func row(_ item: TranscriptItem, _ chat: ChatModel, _ theme: Theme) -> some View {
-        switch item {
-        case .date(let date):
-            // More room above than below, so the time belongs to what follows it.
-            Text(ChatDate.text(for: date))
-                .font(.system(size: 12))
-                .foregroundStyle(theme.secondaryText)
-                .padding(.top, 14)
-                .padding(.bottom, 6)
-        case .activity(_, let tools):
-            Text(ToolSummary.text(for: tools))
-                .font(.system(size: 12))
-                .foregroundStyle(theme.secondaryText)
-                .lineLimit(1)
-                .padding(.top, 4)
-                .padding(.bottom, -4)
-        case .bot(let id, let text):
-            WithActions(
-                text: text, isLeading: true,
-                canReact: chat.canReact(id),
-                turnAction: chat.canRetry(id) ? .retry { chat.retry(bot, through: roster) } : nil,
-                hasReactions: !(chat.reactions[id] ?? []).isEmpty,
-                reactionPicker: $reactionPicker,
-                reactionRow: id
-            ) {
-                // As wide as its words and no wider than 560, so the buttons sit beside it.
-                NoWiderThan(width: 560) {
-                    bubble(item, text, chat, theme)
-                        .background(theme.bubble, in: RoundedRectangle(cornerRadius: 15))
-                        .overlay(RoundedRectangle(cornerRadius: 15).strokeBorder(theme.bubbleEdge))
-                        .reactions(chat.reactions[id] ?? [], isLeading: true, canChange: chat.canReact(id)) {
-                            chat.react($0, to: id, of: bot, through: roster)
-                        }
-                }
-            }
-        case .user(let id, let text):
-            // As the gateway stores it, a message holds more than was typed: what was
-            // attached is shown as what it is, and the rest is for the bot.
-            // Only a stored message is read for what went with it. One on its way is the
-            // words as typed, whatever they say.
-            let parts = id < 0 ? SentParts(stored: "") : chat.parts(of: text)
-            let words = id < 0 ? text : parts.words
-            // The one on its way shows what was picked; a stored one, what the gateway has.
-            let onItsWay = id == chat.sentAttachmentsRow ? chat.sentAttachments : []
-            VStack(alignment: .trailing, spacing: 6) {
-                if !onItsWay.isEmpty || !parts.images.isEmpty || !parts.files.isEmpty {
-                    if words.isEmpty {
-                        // A message that was only what went with it still takes Undo.
-                        WithActions(
-                            text: "", isLeading: false,
-                            turnAction: chat.canUndo(id) ? .undo { chat.undo(bot, through: roster) } : nil,
-                            hasReactions: !(chat.reactions[id] ?? []).isEmpty,
-                            reactionPicker: $reactionPicker
-                        ) {
-                            SentAttachments(picked: onItsWay, images: parts.images, files: parts.files, bot: bot, roster: roster)
-                                .reactions(chat.reactions[id] ?? [], isLeading: false, canChange: false) { _ in }
-                        }
-                    } else {
-                        SentAttachments(picked: onItsWay, images: parts.images, files: parts.files, bot: bot, roster: roster)
-                    }
-                }
-                if !words.isEmpty {
-                    WithActions(
-                        text: words, isLeading: false,
-                        turnAction: chat.canUndo(id) ? .undo { chat.undo(bot, through: roster) } : nil,
-                        hasReactions: !(chat.reactions[id] ?? []).isEmpty,
-                        reactionPicker: $reactionPicker
-                    ) {
-                        NoWiderThan(width: 560) {
-                            bubble(item, words, chat, theme)
-                                .background(theme.sentBubble, in: RoundedRectangle(cornerRadius: 18))
-                                // The bot's reactions to it; the person reacts to the bot's.
-                                .reactions(chat.reactions[id] ?? [], isLeading: false, canChange: false) { _ in }
-                        }
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .trailing)
-        }
-    }
-
-    private func bubble(_ item: TranscriptItem, _ text: String, _ chat: ChatModel, _ theme: Theme) -> some View {
-        let shown = chat.styled[item.id] ?? [StyledBlock(id: 0, kind: .paragraph, raw: text, text: AttributedString(text))]
-        let blocks = isFinding ? ChatFind.marked(shown, in: item.id, query: findQuery, current: currentFind, theme: theme) : shown
-        let zoom = TextZoom.clamped(zoom)
-        // Paragraphs, headings and list items that follow one another are one piece of
-        // text, so a drag selects across them. Code, tables, quotes and rules stand apart.
-        let stretches = Self.stretches(of: blocks)
-        // A reply still arriving has an id below nothing; stored, it has its own. One
-        // that arrived whole and could not then be read back stored can change no more
-        // either: nothing is at work in the chat.
-        let isSettled: Bool = { if case .bot(let id, _) = item { return id >= 0 || !chat.isWorking }; return true }()
-        return VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(stretches.enumerated()), id: \.element.id) { index, stretch in
-                Group {
-                    if stretch.flows {
-                        FlowingText(Self.flowing(stretch.blocks, theme, zoom: zoom))
-                    } else {
-                        self.block(stretch.blocks[0], theme, isSettled: isSettled, zoom: zoom, in: item.id, of: chat)
-                    }
-                }
-                // As tall as its words need at this width: with more than one block, a
-                // long paragraph was otherwise cut to a line with an ellipsis.
-                .fixedSize(horizontal: false, vertical: true)
-                // For finding: what to bring into sight.
-                .id(Self.partID(item.id, stretch.id))
-                .padding(.top, index == 0 ? 0 : Self.gap(above: stretch.blocks[0].kind, below: stretches[index - 1].blocks.last!.kind) * zoom)
-            }
-        }
-        .font(.system(size: 14 * zoom))
-        .lineSpacing(4 * zoom)
-        .foregroundStyle(theme.text)
-        .textSelection(.enabled)
-        .padding(.horizontal, 13)
-        .padding(.vertical, 9)
     }
 
     /// Blocks that follow one another and can be shown as one piece of text, or one block
@@ -2290,6 +2438,13 @@ struct ChatView: View {
     /// The blocks of one stretch as a single text: each a paragraph of it, set out as the
     /// separate blocks were.
     static func flowing(_ blocks: [StyledBlock], _ theme: Theme, zoom: CGFloat = 1) -> NSAttributedString {
+        flowingText(blocks, theme, zoom: zoom).text
+    }
+
+    /// The same, with where the newest words are, which are painted grey over the text for
+    /// a moment rather than set in it, so turning them to full colour lays nothing out again.
+    static func flowingText(_ blocks: [StyledBlock], _ theme: Theme, zoom: CGFloat = 1) -> (text: NSAttributedString, grey: NSRange?) {
+        var greyFrom: Int?
         let whole = NSMutableAttributedString()
         for (index, block) in blocks.enumerated() {
             let style = NSMutableParagraphStyle()
@@ -2329,8 +2484,8 @@ struct ChatView: View {
                     attributes[.link] = link
                     attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
                 }
-                // The newest words, in grey for a moment.
-                if run.foregroundColor != nil { attributes[.foregroundColor] = NSColor.gray }
+                // The newest words, in grey for a moment: painted over, from here to the end.
+                if run.foregroundColor != nil, greyFrom == nil { greyFrom = whole.length + paragraph.length }
                 // A find in the chat.
                 if let behind = run.backgroundColor { attributes[.backgroundColor] = NSColor(behind) }
                 attributes[.font] = font
@@ -2343,17 +2498,201 @@ struct ChatView: View {
             paragraph.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: paragraph.length))
             whole.append(paragraph)
         }
-        return whole
+        return (whole, greyFrom.map { NSRange(location: $0, length: whole.length - $0) })
     }
 
     /// The room between two blocks of a reply: items of a list sit close, a heading stands off.
-    private static func gap(above kind: ReplyBlock.Kind, below previous: ReplyBlock.Kind) -> CGFloat {
+    static func gap(above kind: ReplyBlock.Kind, below previous: ReplyBlock.Kind) -> CGFloat {
         switch (previous, kind) {
         case (.item, .item): 5
         case (_, .heading): 16
         case (.heading, _): 6
         default: 10
         }
+    }
+
+}
+
+/// What one row of the chat shows, worked out by the chat once per redraw. A row is drawn
+/// again only when this changes.
+struct RowLook: Equatable {
+    /// The blocks its words are shown in, with any finds marked. Nil for a date or a line
+    /// about tools used.
+    var blocks: [StyledBlock]?
+    var reactions: [Reaction] = []
+    var canReact = false
+    var canRetry = false
+    var canUndo = false
+    /// A reply that can change no more: stored, or arrived whole with nothing at work.
+    var isSettled = true
+    /// What went with the person's stored message, and what is on its way with theirs.
+    var parts = SentParts(stored: "")
+    var onItsWay: [PickedFile] = []
+    var zoom: CGFloat = 1
+}
+
+/// One row of the chat. A view of its own, compared by what it shows, so that a redraw of
+/// the chat (its pane resizing as the sidebar opens or closes, a word arriving in another
+/// message, a find typed) leaves every row it does not change as it was, without building
+/// or measuring its text again. It reads nothing of the chat as it draws: the chat hands
+/// it everything, so a change elsewhere in the chat does not reach it.
+struct MessageRow: View, Equatable {
+    let item: TranscriptItem
+    let look: RowLook
+    let bot: Bot
+    let roster: RosterModel
+    let chat: ChatModel
+    @Binding var reactionPicker: ReactionPickerTarget?
+    @Environment(\.colorScheme) private var scheme
+
+    nonisolated static func == (a: MessageRow, b: MessageRow) -> Bool {
+        a.item == b.item && a.look == b.look && a.bot == b.bot && a.roster === b.roster && a.chat === b.chat
+    }
+
+    var body: some View {
+        let theme = Theme(scheme)
+        switch item {
+        case .date(let date):
+            // More room above than below, so the time belongs to what follows it.
+            Text(ChatDate.text(for: date))
+                .font(.system(size: 12))
+                .foregroundStyle(theme.secondaryText)
+                .padding(.top, 14)
+                .padding(.bottom, 6)
+        case .activity(_, let tools):
+            Text(ToolSummary.text(for: tools))
+                .font(.system(size: 12))
+                .foregroundStyle(theme.secondaryText)
+                .lineLimit(1)
+                .padding(.top, 4)
+                .padding(.bottom, -4)
+        case .bot(let id, let text):
+            WithActions(
+                text: text, isLeading: true,
+                canReact: look.canReact,
+                turnAction: look.canRetry ? .retry { chat.retry(bot, through: roster) } : nil,
+                hasReactions: !look.reactions.isEmpty,
+                reactionPicker: $reactionPicker,
+                reactionRow: id
+            ) {
+                // As wide as its words and no wider than 560, so the buttons sit beside it.
+                NoWiderThan(width: 560) {
+                    bubble(theme)
+                        .background(theme.bubble, in: RoundedRectangle(cornerRadius: 15))
+                        .overlay(RoundedRectangle(cornerRadius: 15).strokeBorder(theme.bubbleEdge))
+                        .reactions(look.reactions, isLeading: true, canChange: look.canReact) {
+                            chat.react($0, to: id, of: bot, through: roster)
+                        }
+                }
+            }
+        case .user(let id, let text):
+            // As the gateway stores it, a message holds more than was typed: what was
+            // attached is shown as what it is, and the rest is for the bot.
+            // Only a stored message is read for what went with it. One on its way is the
+            // words as typed, whatever they say.
+            let parts = look.parts
+            let words = id < 0 ? text : parts.words
+            // The one on its way shows what was picked; a stored one, what the gateway has.
+            let onItsWay = look.onItsWay
+            VStack(alignment: .trailing, spacing: 6) {
+                if !onItsWay.isEmpty || !parts.images.isEmpty || !parts.files.isEmpty {
+                    if words.isEmpty {
+                        // A message that was only what went with it still takes Undo.
+                        WithActions(
+                            text: "", isLeading: false,
+                            turnAction: look.canUndo ? .undo { chat.undo(bot, through: roster) } : nil,
+                            hasReactions: !look.reactions.isEmpty,
+                            reactionPicker: $reactionPicker
+                        ) {
+                            SentAttachments(picked: onItsWay, images: parts.images, files: parts.files, bot: bot, roster: roster)
+                                .reactions(look.reactions, isLeading: false, canChange: false) { _ in }
+                        }
+                    } else {
+                        SentAttachments(picked: onItsWay, images: parts.images, files: parts.files, bot: bot, roster: roster)
+                    }
+                }
+                if !words.isEmpty {
+                    WithActions(
+                        text: words, isLeading: false,
+                        turnAction: look.canUndo ? .undo { chat.undo(bot, through: roster) } : nil,
+                        hasReactions: !look.reactions.isEmpty,
+                        reactionPicker: $reactionPicker
+                    ) {
+                        NoWiderThan(width: 560) {
+                            bubble(theme)
+                                .background(theme.sentBubble, in: RoundedRectangle(cornerRadius: 18))
+                                // The bot's reactions to it; the person reacts to the bot's.
+                                .reactions(look.reactions, isLeading: false, canChange: false) { _ in }
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+    }
+
+    private func bubble(_ theme: Theme) -> some View {
+        let blocks = look.blocks ?? []
+        let zoom = look.zoom
+        // Paragraphs, headings and list items that follow one another are one piece of
+        // text, so a drag selects across them. Code, tables, quotes and rules stand apart.
+        let stretches = ChatView.stretches(of: blocks)
+        return VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(stretches.enumerated()), id: \.element.id) { index, stretch in
+                ReplyPart(blocks: stretch.blocks, flows: stretch.flows, zoom: zoom, isSettled: look.isSettled,
+                          itemID: item.id, bot: bot, roster: roster, chat: chat)
+                    .equatable()
+                // As tall as its words need at this width: with more than one block, a
+                // long paragraph was otherwise cut to a line with an ellipsis.
+                .fixedSize(horizontal: false, vertical: true)
+                // For finding: what to bring into sight.
+                .id(ChatView.partID(item.id, stretch.id))
+                .padding(.top, index == 0 ? 0 : ChatView.gap(above: stretch.blocks[0].kind, below: stretches[index - 1].blocks.last!.kind) * zoom)
+            }
+        }
+        .font(.system(size: 14 * zoom))
+        .lineSpacing(4 * zoom)
+        .foregroundStyle(theme.text)
+        .textSelection(.enabled)
+        .padding(.horizontal, 13)
+        .padding(.vertical, 9)
+    }
+
+}
+
+/// One stretch of a message: paragraphs, headings and list items as one piece of text, or
+/// a block that stands by itself. A view of its own, compared by what it shows, so that as
+/// a reply arrives only the stretch that changed is built and laid out again.
+struct ReplyPart: View, Equatable {
+    let blocks: [StyledBlock]
+    let flows: Bool
+    let zoom: CGFloat
+    let isSettled: Bool
+    let itemID: TranscriptItem.ID
+    let bot: Bot
+    let roster: RosterModel
+    let chat: ChatModel
+    @Environment(\.colorScheme) private var scheme
+
+    nonisolated static func == (a: ReplyPart, b: ReplyPart) -> Bool {
+        a.flows == b.flows && a.zoom == b.zoom && a.isSettled == b.isSettled && a.itemID == b.itemID
+            && a.blocks == b.blocks && a.bot == b.bot && a.roster === b.roster && a.chat === b.chat
+    }
+
+    var body: some View {
+        let theme = Theme(scheme)
+        Group {
+            if flows {
+                let flowing = ChatView.flowingText(blocks, theme, zoom: zoom)
+                FlowingText(flowing.text, grey: flowing.grey)
+            } else {
+                block(blocks[0], theme, zoom: zoom)
+            }
+        }
+        // Where its leading edge is, said outright, as it would be found: otherwise every
+        // pass over the chat asks all the way down for it, which SwiftUI does not keep, and
+        // measures a code block or table both as it fits and as it scrolls.
+        .alignmentGuide(.leading) { _ in 0 }
     }
 
     /// A box for what can be wider than the bubble: as wide as what is in it when that
@@ -2372,7 +2711,7 @@ struct ChatView: View {
     }
 
     @ViewBuilder
-    private func block(_ block: StyledBlock, _ theme: Theme, isSettled: Bool = true, zoom: CGFloat = 1, in item: TranscriptItem.ID, of chat: ChatModel) -> some View {
+    private func block(_ block: StyledBlock, _ theme: Theme, zoom: CGFloat = 1) -> some View {
         switch block.kind {
         case .paragraph:
             Text(block.text)
@@ -2438,7 +2777,7 @@ struct ChatView: View {
                 .lineSpacing(4)
                 .id(block.raw)
         case .page:
-            InlinePage(path: block.raw, bot: bot, roster: roster, chat: chat, key: ChatModel.pageKey(item, block.id), isSettled: isSettled)
+            InlinePage(path: block.raw, bot: bot, roster: roster, chat: chat, key: ChatModel.pageKey(itemID, block.id), isSettled: isSettled)
                 .lineSpacing(4)
                 .id(block.raw)
         }

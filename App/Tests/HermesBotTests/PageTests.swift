@@ -16,7 +16,7 @@ struct PageTests {
     final class Shown {
         let view: PageView
         let keeper = PageFrame.Keeper()
-        let window: NSWindow
+        let window: NSPanel
         var news: [PageFrame.News] = []
         var opened: [URL] = []
 
@@ -24,7 +24,7 @@ struct PageTests {
             #expect(PageFrame.canKeepIn)
             let rules = try #require(await PageFrame.rules.value)
             view = PageFrame.makeView(rules: rules, store: try #require(PageFrame.closedStore()), keeper: keeper)
-            window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 534, height: 120), styleMask: [.borderless], backing: .buffered, defer: false)
+            window = OnScreenTesting.panel(width: 534, height: 120)
             window.contentView = view
             keeper.tell = { [weak self] in self?.news.append($0) }
             // Not in a chat, and never in front: taken as seen, for what it sends.
@@ -235,7 +235,8 @@ struct PageTests {
 
     /// A link opens in the browser when the person clicked that link, once, and never
     /// because a script did, even one run by a real click on something else.
-    @Test func aLinkOpensInTheBrowserOnlyWhenItWasClicked() async throws {
+    @Test(.tags(.onScreen), .enabled(if: OnScreenTesting.enabled, OnScreenTesting.whySkipped))
+    func aLinkOpensInTheBrowserOnlyWhenItWasClicked() async throws {
         let shown = try await Shown()
         let row = "display:block;width:200px;height:40px"
         shown.show(PageFrame.document("""
@@ -325,7 +326,8 @@ struct PageTests {
     /// A page sends its bot a message as in Hermes's own app: from its script, or by a real
     /// click on something marked to send. Words only, never too many, one a second, and it
     /// is told only whether it went.
-    @Test func aPageSendsAsInHermesOwnApp() async throws {
+    @Test(.tags(.onScreen), .enabled(if: OnScreenTesting.enabled, OnScreenTesting.whySkipped))
+    func aPageSendsAsInHermesOwnApp() async throws {
         let shown = try await Shown()
         var sent: [String] = []
         shown.keeper.sends = { words, _ in sent.append(words); return true }
